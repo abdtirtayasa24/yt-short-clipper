@@ -45,6 +45,11 @@ class FakeUpdate:
         self.message = FakeMessage()
 
 
+class FakeContext:
+    def __init__(self, args=None):
+        self.args = args or []
+
+
 class FakeTelegramBot:
     def __init__(self):
         self.started = False
@@ -90,6 +95,63 @@ def test_authorized_operator_commands_work_and_unknown_chats_are_rejected(tmp_pa
         assert "Bot Control Mode" in start_update.message.replies[0]
         assert "/status" in help_update.message.replies[0]
         assert "status: ok" in status_update.message.replies[0]
+
+    asyncio.run(run_test())
+
+
+def test_authorized_operator_can_view_and_update_workflow_defaults(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+
+        view_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_defaults(view_update, FakeContext()) is True
+        assert "captions: on" in view_update.message.replies[0]
+        assert "hooks: on" in view_update.message.replies[0]
+
+        updates = [
+            (["set", "captions", "off"], "captions: off"),
+            (["set", "hooks", "off"], "hooks: off"),
+            (["set", "publish_youtube", "on"], "publish_youtube: on"),
+            (["set", "publish_tiktok", "on"], "publish_tiktok: on"),
+            (["set", "subtitle_language", "id"], "subtitle_language: id"),
+        ]
+        for args, confirmation in updates:
+            update = FakeUpdate(settings.telegram_authorized_chat_id)
+            assert await bot.handle_defaults(update, FakeContext(args)) is True
+            assert confirmation in update.message.replies[0]
+
+        updated_view = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_defaults(updated_view, FakeContext()) is True
+        reply = updated_view.message.replies[0]
+        assert "captions: off" in reply
+        assert "hooks: off" in reply
+        assert "publish_youtube: on" in reply
+        assert "publish_tiktok: on" in reply
+        assert "subtitle_language: id" in reply
+
+    asyncio.run(run_test())
+
+
+def test_defaults_rejects_unknown_chats_and_invalid_updates_without_mutating(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+
+        unauthorized_update = FakeUpdate(999)
+        assert await bot.handle_defaults(unauthorized_update, FakeContext(["set", "captions", "off"])) is False
+        assert unauthorized_update.message.replies == ["Unauthorized chat."]
+
+        invalid_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_defaults(invalid_update, FakeContext(["set", "captions", "maybe"])) is False
+        assert "Usage:" in invalid_update.message.replies[0]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            defaults = session.scalars(select(WorkflowDefaults)).one()
+            assert defaults.captions_enabled is True
 
     asyncio.run(run_test())
 
