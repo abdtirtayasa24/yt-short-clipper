@@ -1,8 +1,10 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from bot_app.clip_archive import create_clip_record
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
 from bot_app.models import WorkflowDefaults
@@ -40,6 +42,63 @@ def test_combined_bot_server_creates_sqlite_parent_directory(tmp_path):
     initialize_database(nested_database_url)
 
     assert (tmp_path / "nested" / "data" / "bot.db").exists()
+
+
+def test_public_clip_link_downloads_recorded_archive_file(tmp_path):
+    settings = make_settings(tmp_path)
+    clip_file = settings.clip_archive_dir / "session-1" / "master.mp4"
+    clip_file.parent.mkdir(parents=True)
+    clip_file.write_bytes(b"clip-bytes")
+
+    initialize_database(settings.database_url)
+    session_factory = create_session_factory(settings.database_url)
+    with session_factory() as session:
+        clip = create_clip_record(session, settings, clip_file)
+        assert clip.public_clip_link == f"https://clips.example.com/clips/{clip.clip_id}/download"
+        assert clip.expires_at is not None
+        assert clip.expires_at.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc)
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        response = client.get(f"/clips/{clip.clip_id}/download")
+
+    assert response.status_code == 200
+    assert response.content == b"clip-bytes"
+
+
+def test_public_clip_link_rejects_unknown_missing_expired_deleted_and_unsafe_records(tmp_path):
+    settings = make_settings(tmp_path)
+    initialize_database(settings.database_url)
+    session_factory = create_session_factory(settings.database_url)
+
+    missing_file = settings.clip_archive_dir / "missing.mp4"
+    expired_file = settings.clip_archive_dir / "expired.mp4"
+    deleted_file = settings.clip_archive_dir / "deleted.mp4"
+    unsafe_file = tmp_path / "outside.mp4"
+    expired_file.parent.mkdir(parents=True)
+    expired_file.write_bytes(b"expired")
+    deleted_file.write_bytes(b"deleted")
+    unsafe_file.write_bytes(b"unsafe")
+
+    with session_factory() as session:
+        missing = create_clip_record(session, settings, missing_file)
+        expired = create_clip_record(
+            session,
+            settings,
+            expired_file,
+            expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+        deleted = create_clip_record(session, settings, deleted_file, deleted_at=datetime.now(timezone.utc))
+        unsafe = create_clip_record(session, settings, unsafe_file)
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.get("/clips/unknown/download").status_code == 404
+        assert client.get(f"/clips/{missing.clip_id}/download").status_code == 404
+        assert client.get(f"/clips/{expired.clip_id}/download").status_code == 404
+        assert client.get(f"/clips/{deleted.clip_id}/download").status_code == 404
+        assert client.get(f"/clips/{unsafe.clip_id}/download").status_code == 404
+        assert client.get("/clips/../download").status_code in {404, 422}
 
 
 def test_combined_bot_server_reports_health_and_creates_workflow_defaults(tmp_path):
