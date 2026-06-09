@@ -99,6 +99,20 @@ pyinstaller build.spec
 - **Prompt Engineering**: Changes to logic often require changes to `SYSTEM_PROMPT.md`. Check that file if highlight quality degrades.
 - **Dependencies**: `utils/dependency_manager.py` handles auto-downloading binaries (ffmpeg/yt-dlp) for end-users. Do not break this flow.
 
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues for this repo. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Triage labels use the default canonical vocabulary. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Domain docs use a single-context layout. See `docs/agents/domain.md`.
+
 ## 🔗 Related Documentation
 - `README.md`: General user info.
 - `GUIDE.md`: Detailed usage guide.
