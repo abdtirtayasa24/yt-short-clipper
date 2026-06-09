@@ -10,6 +10,7 @@ from bot_app.clip_archive import create_clip_record
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
 from bot_app.models import WorkflowDefaults
+from bot_app.source_queue import consume_source_video, get_pending_source_videos
 from bot_app.settings import Settings
 from bot_app.telegram_bot import AuthorizedOperatorTelegramBot
 
@@ -95,6 +96,68 @@ def test_authorized_operator_commands_work_and_unknown_chats_are_rejected(tmp_pa
         assert "Bot Control Mode" in start_update.message.replies[0]
         assert "/status" in help_update.message.replies[0]
         assert "status: ok" in status_update.message.replies[0]
+
+    asyncio.run(run_test())
+
+
+def test_authorized_operator_can_add_list_and_remove_source_videos(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+
+        add_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_sources(
+            add_update,
+            FakeContext(["add", "https://youtu.be/one", "https://youtu.be/two"]),
+        ) is True
+        assert "Added 2 Source Videos" in add_update.message.replies[0]
+
+        list_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_sources(list_update, FakeContext(["list"])) is True
+        assert "pending" in list_update.message.replies[0]
+        assert "https://youtu.be/one" in list_update.message.replies[0]
+        assert "https://youtu.be/two" in list_update.message.replies[0]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            pending = get_pending_source_videos(session)
+            source_id = pending[0].id
+
+        remove_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_sources(remove_update, FakeContext(["remove", str(source_id)])) is True
+        assert f"Removed Source Video {source_id}" in remove_update.message.replies[0]
+
+        updated_list = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_sources(updated_list, FakeContext(["list"])) is True
+        assert "cancelled" in updated_list.message.replies[0]
+
+    asyncio.run(run_test())
+
+
+def test_source_queue_consumes_pending_videos_once_and_rejects_unknown_chats(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+
+        unauthorized_update = FakeUpdate(999)
+        assert await bot.handle_sources(unauthorized_update, FakeContext(["add", "https://youtu.be/nope"])) is False
+        assert unauthorized_update.message.replies == ["Unauthorized chat."]
+
+        add_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_sources(add_update, FakeContext(["add", "https://youtu.be/one"])) is True
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            pending = get_pending_source_videos(session)
+            assert len(pending) == 1
+            consume_source_video(session, pending[0])
+            assert get_pending_source_videos(session) == []
+
+        list_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_sources(list_update, FakeContext(["list"])) is True
+        assert "consumed" in list_update.message.replies[0]
 
     asyncio.run(run_test())
 

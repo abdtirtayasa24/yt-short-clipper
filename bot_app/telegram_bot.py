@@ -5,6 +5,7 @@ from telegram.ext import Application, ApplicationBuilder, CommandHandler, Contex
 
 from bot_app.database import create_session_factory, ensure_workflow_defaults
 from bot_app.settings import Settings
+from bot_app.source_queue import add_source_videos, cancel_pending_source_video, get_source_videos
 
 
 class TelegramBotShell(Protocol):
@@ -37,6 +38,7 @@ class AuthorizedOperatorTelegramBot:
         self.application.add_handler(CommandHandler("help", self.handle_help))
         self.application.add_handler(CommandHandler("status", self.handle_status))
         self.application.add_handler(CommandHandler("defaults", self.handle_defaults))
+        self.application.add_handler(CommandHandler("sources", self.handle_sources))
         self.started = True
 
     async def stop(self) -> None:
@@ -64,7 +66,7 @@ class AuthorizedOperatorTelegramBot:
     async def handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
             return False
-        await update.message.reply_text("Available commands: /start, /help, /status, /defaults")
+        await update.message.reply_text("Available commands: /start, /help, /status, /defaults, /sources")
         return True
 
     async def handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -72,6 +74,50 @@ class AuthorizedOperatorTelegramBot:
             return False
         await update.message.reply_text("Bot Control Mode status: ok")
         return True
+
+    async def handle_sources(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        if await self._reject_unknown_chat(update):
+            return False
+
+        args = list(getattr(context, "args", []) or [])
+        if not args:
+            await update.message.reply_text(self._sources_usage())
+            return False
+
+        command = args[0]
+        if command == "add" and len(args) >= 2:
+            with self.session_factory() as session:
+                sources = add_source_videos(session, args[1:])
+            await update.message.reply_text(f"Added {len(sources)} Source Videos.")
+            return True
+
+        if command == "list" and len(args) == 1:
+            await update.message.reply_text(self._format_source_videos())
+            return True
+
+        if command == "remove" and len(args) == 2 and args[1].isdigit():
+            source_id = int(args[1])
+            with self.session_factory() as session:
+                removed = cancel_pending_source_video(session, source_id)
+            if removed:
+                await update.message.reply_text(f"Removed Source Video {source_id}.")
+                return True
+
+        await update.message.reply_text(self._sources_usage())
+        return False
+
+    def _format_source_videos(self) -> str:
+        with self.session_factory() as session:
+            sources = get_source_videos(session)
+            if not sources:
+                return "Source Video Queue is empty."
+            lines = ["Source Video Queue:"]
+            for source in sources:
+                lines.append(f"#{source.id} [{source.status}] {source.url}")
+            return "\n".join(lines)
+
+    def _sources_usage(self) -> str:
+        return "Usage: /sources add <url1> [url2 ...], /sources list, or /sources remove <source_id>"
 
     async def handle_defaults(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
