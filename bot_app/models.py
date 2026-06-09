@@ -1,11 +1,75 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, Integer, String, Text
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import ForeignKey
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class RunLog(Base):
+    """Persistent record of a Bot Control Mode clipping run."""
+
+    __tablename__ = "run_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    selected_highlights: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    events: Mapped[list["RunEvent"]] = relationship(back_populates="run")
+    highlight_candidates: Mapped[list["HighlightCandidate"]] = relationship(back_populates="run")
+
+
+class RunEvent(Base):
+    """Progress or error event for a Run Log."""
+
+    __tablename__ = "run_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("run_logs.id"), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    run: Mapped[RunLog] = relationship(back_populates="events")
+
+
+class HighlightCandidate(Base):
+    """Highlight candidate shown for Manual Clipping review."""
+
+    __tablename__ = "highlight_candidates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("run_logs.id"), nullable=False, index=True)
+    candidate_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    start_time: Mapped[str] = mapped_column(String(32), nullable=False)
+    end_time: Mapped[str] = mapped_column(String(32), nullable=False)
+    virality_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    hook_text: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    run: Mapped[RunLog] = relationship(back_populates="highlight_candidates")
 
 
 class SourceVideo(Base):

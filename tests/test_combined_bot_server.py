@@ -7,9 +7,10 @@ from sqlalchemy import select
 
 from bot_app.ai_providers import GeminiTextProvider, OpenRouterAudioAdapter
 from bot_app.clip_archive import create_clip_record
+from bot_app.manual_clipping import HighlightDraft, ManualClippingService
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
-from bot_app.models import WorkflowDefaults
+from bot_app.models import HighlightCandidate, RunEvent, RunLog, WorkflowDefaults
 from bot_app.source_queue import consume_source_video, get_pending_source_videos
 from bot_app.settings import Settings
 from bot_app.telegram_bot import AuthorizedOperatorTelegramBot
@@ -96,6 +97,83 @@ def test_authorized_operator_commands_work_and_unknown_chats_are_rejected(tmp_pa
         assert "Bot Control Mode" in start_update.message.replies[0]
         assert "/status" in help_update.message.replies[0]
         assert "status: ok" in status_update.message.replies[0]
+
+    asyncio.run(run_test())
+
+
+class FakeHighlightFinder:
+    def __init__(self):
+        self.calls = []
+
+    def find_highlights(self, youtube_url, count):
+        self.calls.append((youtube_url, count))
+        return [
+            HighlightDraft(
+                title="Great moment",
+                start_time="00:00:01,000",
+                end_time="00:01:01,000",
+                virality_score=9,
+                hook_text="Watch this",
+                description="A strong highlight",
+            )
+            for _ in range(count)
+        ]
+
+
+def test_authorized_operator_can_start_select_and_cancel_manual_clipping(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        finder = FakeHighlightFinder()
+        service = ManualClippingService(settings, finder)
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        start_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(start_update, FakeContext(["https://youtu.be/manual"])) is True
+        reply = start_update.message.replies[0]
+        assert "Run Log 1 highlight candidates" in reply
+        assert "Great moment" in reply
+        assert "00:00:01,000 - 00:01:01,000" in reply
+        assert "Virality: 9" in reply
+        assert "Hook: Watch this" in reply
+        assert "Description: A strong highlight" in reply
+        assert finder.calls == [("https://youtu.be/manual", 5)]
+
+        select_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(select_update, FakeContext(["select", "1", "1", "3"])) is True
+        assert "Selected highlights for Run Log 1" in select_update.message.replies[0]
+
+        second_start = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(second_start, FakeContext(["https://youtu.be/cancel"])) is True
+        cancel_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(cancel_update, FakeContext(["cancel", "2"])) is True
+        assert "Cancelled Run Log 2" in cancel_update.message.replies[0]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            runs = session.scalars(select(RunLog).order_by(RunLog.id)).all()
+            assert runs[0].status == "selection_ready"
+            assert runs[0].selected_highlights == "1,3"
+            assert runs[1].status == "cancelled"
+            assert len(session.scalars(select(HighlightCandidate)).all()) == 10
+            assert len(session.scalars(select(RunEvent)).all()) >= 5
+
+    asyncio.run(run_test())
+
+
+def test_clip_rejects_unknown_chats_without_creating_run_logs(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+
+        unauthorized_update = FakeUpdate(999)
+        assert await bot.handle_clip(unauthorized_update, FakeContext(["https://youtu.be/nope"])) is False
+        assert unauthorized_update.message.replies == ["Unauthorized chat."]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            assert session.scalars(select(RunLog)).all() == []
 
     asyncio.run(run_test())
 
