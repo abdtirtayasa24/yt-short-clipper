@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from bot_app.ai_providers import GeminiTextProvider, OpenRouterAudioAdapter
 from bot_app.clip_archive import create_clip_record
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
@@ -21,6 +22,86 @@ def make_settings(tmp_path: Path) -> Settings:
         openrouter_api_key="openrouter-test-key",
         clip_archive_dir=tmp_path / "clips",
     )
+
+
+def test_gemini_text_provider_uses_environment_configuration(monkeypatch, tmp_path):
+    settings = make_settings(tmp_path)
+    calls = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return type("Response", (), {"text": "highlight json"})()
+
+    class FakeClient:
+        def __init__(self, api_key):
+            self.api_key = api_key
+            self.models = FakeModels()
+
+    monkeypatch.setattr("bot_app.ai_providers.genai.Client", FakeClient)
+
+    provider = GeminiTextProvider(settings)
+    result = provider.generate_text("find highlights")
+
+    assert provider.client.api_key == "gemini-test-key"
+    assert result == "highlight json"
+    assert calls == [{"model": "gemini-3.1-flash-lite", "contents": "find highlights"}]
+
+
+def test_openrouter_audio_adapter_points_openai_sdk_at_openrouter(monkeypatch, tmp_path):
+    settings = make_settings(tmp_path)
+    captured_client_kwargs = {}
+    transcription_calls = []
+    speech_calls = []
+
+    class FakeTranscriptions:
+        def create(self, **kwargs):
+            transcription_calls.append(kwargs)
+            return {"text": "caption"}
+
+    class FakeSpeech:
+        def create(self, **kwargs):
+            speech_calls.append(kwargs)
+            return type("SpeechResponse", (), {"content": b"audio"})()
+
+    class FakeAudio:
+        def __init__(self):
+            self.transcriptions = FakeTranscriptions()
+            self.speech = FakeSpeech()
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured_client_kwargs.update(kwargs)
+            self.audio = FakeAudio()
+
+    monkeypatch.setattr("bot_app.ai_providers.OpenAI", FakeOpenAI)
+
+    audio_file = object()
+    adapter = OpenRouterAudioAdapter(settings)
+    transcript = adapter.transcribe(file=audio_file)
+    speech = adapter.create_hook_voice("listen now")
+
+    assert captured_client_kwargs == {
+        "api_key": "openrouter-test-key",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+    assert transcript == {"text": "caption"}
+    assert speech.content == b"audio"
+    assert transcription_calls == [{"model": "openai/whisper-1", "file": audio_file}]
+    assert speech_calls == [
+        {
+            "model": "canopylabs/orpheus-3b-0.1-ft",
+            "voice": "josh",
+            "input": "listen now",
+        }
+    ]
+
+
+def test_environment_configuration_does_not_require_openai_provider_settings(tmp_path):
+    settings = make_settings(tmp_path)
+
+    assert not hasattr(settings, "openai_api_key")
+    assert not hasattr(settings, "ai_providers")
 
 
 def test_environment_configuration_uses_bot_control_mode_defaults(tmp_path):
