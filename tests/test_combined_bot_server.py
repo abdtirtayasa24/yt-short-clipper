@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
 from bot_app.models import WorkflowDefaults
 from bot_app.settings import Settings
+from bot_app.telegram_bot import AuthorizedOperatorTelegramBot
 
 
 def make_settings(tmp_path: Path) -> Settings:
@@ -22,6 +24,88 @@ def make_settings(tmp_path: Path) -> Settings:
         openrouter_api_key="openrouter-test-key",
         clip_archive_dir=tmp_path / "clips",
     )
+
+
+class FakeMessage:
+    def __init__(self):
+        self.replies = []
+
+    async def reply_text(self, text):
+        self.replies.append(text)
+
+
+class FakeChat:
+    def __init__(self, chat_id):
+        self.id = chat_id
+
+
+class FakeUpdate:
+    def __init__(self, chat_id):
+        self.effective_chat = FakeChat(chat_id)
+        self.message = FakeMessage()
+
+
+class FakeTelegramBot:
+    def __init__(self):
+        self.started = False
+        self.stopped = False
+
+    async def start(self):
+        self.started = True
+
+    async def stop(self):
+        self.stopped = True
+
+
+def test_fastapi_lifespan_starts_and_stops_telegram_bot(tmp_path):
+    settings = make_settings(tmp_path)
+    telegram_bot = FakeTelegramBot()
+
+    app = create_app(settings, telegram_bot=telegram_bot)
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert telegram_bot.started is True
+        assert telegram_bot.stopped is False
+
+    assert telegram_bot.stopped is True
+
+
+def test_authorized_operator_commands_work_and_unknown_chats_are_rejected(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        bot = AuthorizedOperatorTelegramBot(settings)
+
+        unauthorized_update = FakeUpdate(999)
+        assert await bot.handle_start(unauthorized_update, None) is False
+        assert unauthorized_update.message.replies == ["Unauthorized chat."]
+
+        start_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        help_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        status_update = FakeUpdate(settings.telegram_authorized_chat_id)
+
+        assert await bot.handle_start(start_update, None) is True
+        assert await bot.handle_help(help_update, None) is True
+        assert await bot.handle_status(status_update, None) is True
+
+        assert "Bot Control Mode" in start_update.message.replies[0]
+        assert "/status" in help_update.message.replies[0]
+        assert "status: ok" in status_update.message.replies[0]
+
+    asyncio.run(run_test())
+
+
+def test_telegram_bot_startup_fails_fast_without_required_configuration(tmp_path):
+    settings = make_settings(tmp_path)
+    settings.telegram_bot_token = ""
+
+    bot = AuthorizedOperatorTelegramBot(settings)
+
+    try:
+        bot.validate_configuration()
+    except ValueError as exc:
+        assert "TELEGRAM_BOT_TOKEN" in str(exc)
+    else:
+        raise AssertionError("Expected missing Telegram configuration to fail fast")
 
 
 def test_gemini_text_provider_uses_environment_configuration(monkeypatch, tmp_path):

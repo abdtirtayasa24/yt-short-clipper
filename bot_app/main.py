@@ -8,17 +8,23 @@ from bot_app.clip_archive import resolve_downloadable_clip_path
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.models import ClipRecord
 from bot_app.settings import Settings
+from bot_app.telegram_bot import AuthorizedOperatorTelegramBot, TelegramBotShell
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, telegram_bot: TelegramBotShell | None = None) -> FastAPI:
     app_settings = settings or Settings()
+    bot = telegram_bot or AuthorizedOperatorTelegramBot(app_settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.settings = app_settings
         app.state.session_factory = create_session_factory(app_settings.database_url)
         initialize_database(app_settings.database_url)
-        yield
+        await bot.start()
+        try:
+            yield
+        finally:
+            await bot.stop()
 
     app = FastAPI(title="YT Short Clipper Bot Control Mode", lifespan=lifespan)
 
