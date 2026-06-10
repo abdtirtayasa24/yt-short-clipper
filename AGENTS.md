@@ -1,105 +1,160 @@
 # 🤖 AGENTS.md - AI Developer Guide for YT-Short-Clipper
 
 ## 📌 Project Overview
-**YT-Short-Clipper** is a desktop application that automates the creation of short-form content (TikTok, Reels, Shorts) from long-form YouTube videos. It leverages AI (GPT-4, Whisper) for highlight detection and captioning, and Computer Vision (OpenCV) for smart cropping.
+
+**YT-Short-Clipper** is now operated through **Bot Control Mode**: a FastAPI Combined Bot Server with a Telegram command interface for clipping, scheduling, publishing, and operations on a VPS.
+
+The legacy Tkinter/CustomTkinter desktop GUI has been removed after Bot Control Mode parity review. Do not reintroduce desktop GUI entry points, pages, dialogs, PyInstaller build artifacts, or desktop-only settings surfaces.
 
 ## 🏗️ Architecture & Tech Stack
 
-### core Technology
+### Core Technology
+
 - **Language**: Python 3.10+
-- **GUI Framework**: CustomTkinter
-- **Video Processing**: FFmpeg (via subprocess), OpenCV (for face detection)
+- **Server**: FastAPI + Uvicorn
+- **Bot Control**: `python-telegram-bot`
+- **Database**: SQLite via SQLAlchemy + Alembic migrations
+- **Video Processing**: FFmpeg via subprocess, OpenCV/MediaPipe paths in `clipper_core.py`
 - **Downloading**: yt-dlp
-- **AI/ML**: 
-  - **LLM**: OpenAI API (GPT-4) or compatible providers (Groq, Gemini via `ai_provider_card.py`)
-  - **Transcription**: OpenAI Whisper API
-  - **TTS**: OpenAI TTS (for hooks)
+- **AI/ML**:
+  - **Gemini Text Provider**: highlight finding and shared publishing metadata via `google-genai`
+  - **OpenRouter Media Provider**: Caption Transcription and hook TTS
+  - **OpenRouter Audio Adapter**: OpenAI SDK may be used only against OpenRouter-compatible audio endpoints
 
-### High-Level Structure
-1. **Frontend (GUI)**:
-   - Entry point: `app.py` (Main `YTShortClipperApp` class).
-   - Pages: Located in `pages/` (e.g., `browse_page.py`, `settings_page.py`).
-   - Navigation: Managed by `YTShortClipperApp.show_page`.
-   - Threading: Heavy tasks (downloads, processing) run in background threads to keep UI responsive.
+## High-Level Structure
 
-2. **Backend (Logic)**:
-   - `clipper_core.py`: **The Brain**. Contains the `AutoClipperCore` class which orchestrates the entire pipeline:
-     1. Download (`download_video`)
-     2. Parse Subtitles (`parse_srt`)
-     3. AI Highlight Detection (`find_highlights`)
-     4. Video Processing (`process_clip`: cut -> portrait -> hook -> captions)
+1. **Combined Bot Server**
+   - Entry point: `bot_app/main.py` (`create_app`).
+   - Owns FastAPI lifespan, database initialization, Telegram bot startup/shutdown, Clip Archive cleanup, and HTTP routes such as health and Public Clip Link downloads.
 
-3. **Data & Config**:
-   - `config.json`: Stores user settings (API keys, preferences). Managed by `ConfigManager`.
-   - `cookies.txt`: Required for YouTube authentication (handled by `COOKIES.md` guide).
-   - `output/`: Generated clips and metadata (`data.json`).
+2. **Telegram Bot Control Mode**
+   - Telegram shell: `bot_app/telegram_bot.py`.
+   - Authorized Operator commands include `/start`, `/help`, `/status`, `/defaults`, `/sources`, `/clip`, `/schedule`, `/auth`, and `/cancel`.
+   - Only the configured Authorized Operator chat may execute commands.
+
+3. **Domain Services**
+   - `bot_app/manual_clipping.py`: Manual Clipping Run Logs, highlight review, selected clip processing, metadata generation, publishing attempts, and cooperative cancellation.
+   - `bot_app/source_queue.py`: Source Video Queue lifecycle.
+   - `bot_app/scheduler.py`: Scheduled Source URL slots and scheduled firing behavior.
+   - `bot_app/clip_archive.py`: Clip Archive record creation, Public Clip Link generation, download safety, and retention cleanup.
+   - `bot_app/ai_providers.py`: Gemini Text Provider and OpenRouter Audio Adapter.
+
+4. **Core Video Logic**
+   - `clipper_core.py`: Existing clipping/video-processing implementation. Treat this as a large legacy core module; make surgical changes and prefer adding Bot Control boundaries around it instead of broad rewrites.
+
+5. **Data & Config**
+   - Environment Configuration is `.env`-based and loaded by `bot_app/settings.py`.
+   - SQLite schema is managed by Alembic migrations under `alembic/versions/`.
+   - Generated clips are stored in the Clip Archive and served through Public Clip Links.
+   - Publishing preauthorization files are generated locally with `tools/preauthorize_publishers.py` and copied to the VPS.
 
 ## 📂 Key Directories & Files
 
 | Path | Description |
 |------|-------------|
-| **`app.py`** | Main application entry point. Handles window management, global state, and navigation. |
-| **`clipper_core.py`** | Core business logic. Contains all video processing and AI interaction code. |
-| **`pages/`** | GUI Page classes. Each file corresponds to a screen in the app. |
-| **`components/`** | Reusable UI widgets (e.g., `ai_provider_card.py` for API settings). |
-| **`utils/`** | Helper utilities (`gpu_detector.py`, `dependency_manager.py`, `logger.py`). |
-| **`assets/`** | Images and icons. |
-| **`SYSTEM_PROMPT.md`** | Default prompt used for AI highlight detection. |
-| **`build.spec`** | PyInstaller configuration for building the executable. |
+| `bot_app/main.py` | Combined Bot Server FastAPI app factory and lifespan. |
+| `bot_app/telegram_bot.py` | Authorized Operator Telegram command shell. |
+| `bot_app/models.py` | SQLAlchemy domain models. |
+| `bot_app/database.py` | Database engine/session/migration helpers. |
+| `bot_app/manual_clipping.py` | Manual Clipping workflows, Run Logs, Clip processing, metadata, publishing. |
+| `bot_app/clip_archive.py` | Clip Archive records, Public Clip Links, retention cleanup. |
+| `bot_app/source_queue.py` | Source Video Queue helpers. |
+| `bot_app/scheduler.py` | Scheduled Source URL slot helpers. |
+| `bot_app/ai_providers.py` | Gemini/OpenRouter provider adapters. |
+| `clipper_core.py` | Legacy core video-processing logic. |
+| `alembic/versions/` | Database migrations. |
+| `tests/` | Bot Control Mode tests. |
+| `tools/preauthorize_publishers.py` | Local browser-based preauthorization for YouTube/TikTok credentials. |
+| `docs/PREAUTHORIZATION.md` | Preauthorization setup instructions. |
+| `CONTEXT.md` | Domain glossary and terminology. |
 
 ## 🔄 Core Workflows
 
-### 1. Highlight Detection Flow
-`clipper_core.py` -> `find_highlights`:
-1.  Reads `.srt` file from download.
-2.  Constructs a prompt using `SYSTEM_PROMPT.md` + Transcript.
-3.  Sends to LLM (GPT-4/Gemini/etc.).
-4.  Parses JSON response containing start/end timestamps and hook text.
+### 1. Manual Clipping
 
-### 2. Portrait Conversion Flow
-`clipper_core.py` -> `convert_to_portrait`:
-1.  **Face Detection**: Uses OpenCV/MediaPipe to find faces in frames.
-2.  **Active Speaker**: Analyzes lip movement (if MediaPipe) or simplistic face tracking (OpenCV).
-3.  **Cropping**: detailed logic to calculate the 9:16 crop window, ensuring smooth transitions (simulated camera cuts).
+1. Authorized Operator runs `/clip <youtube_url>`.
+2. Bot creates a Run Log and asks the Gemini Text Provider for highlight candidates.
+3. Bot displays numbered highlights with title, time range, virality score, hook text, and description.
+4. Authorized Operator selects candidates with `/clip select <run_id> <numbers...>` or cancels.
+5. `/clip process <run_id>` processes selected highlights through the Clipping Queue.
+6. Each generated clip is archived, receives shared metadata, optional publish attempts, and a Telegram summary containing Public Clip Links.
 
-### 3. Captioning Flow
-`clipper_core.py` -> `process_clip`:
-1.  Extracts audio from cut clip.
-2.  Sends to Whisper API -> gets word-level timestamps.
-3.  Generates `.ass` subtitle file with specific styling (Yellow highlight, specific font).
-4.  Burns into video using FFmpeg.
+### 2. Source Video Queue and Scheduling
+
+1. Authorized Operator adds URLs with `/sources add <url1> [url2 ...]`.
+2. `/schedule add daily <HH:MM>` or `/schedule add weekly <weekday> <HH:MM>` creates enabled schedule slots.
+3. Scheduled firings consume pending Source Videos at most once and record Run Logs.
+4. Empty queue firings are recorded but do not message Telegram.
+
+### 3. Clip Archive and Public Clip Links
+
+1. Clip records store unguessable IDs, archive paths, Public Clip Links, metadata, expiry, and deletion state.
+2. `GET /clips/{clip_id}/download` serves only valid, existing, unexpired, undeleted files under the Clip Archive root.
+3. Cleanup removes expired Clip Archive files while preserving Run Log history.
+
+### 4. Publishing
+
+1. Run local preauthorization with `tools/preauthorize_publishers.py` on a machine with a browser.
+2. Copy generated credential/session files to the VPS.
+3. `/auth` reports YouTube/TikTok preauthorization status.
+4. Publishing attempts are recorded per clip/platform when Workflow Defaults enable publishing.
 
 ## 🛠️ Development Setup
 
-### specific Requirements
-- **FFmpeg** and **yt-dlp** must be in PATH or configured.
-- `requirements.txt` contains Python libs.
+### Requirements
+
+- Python 3.10+
+- FFmpeg and yt-dlp available in PATH or configured for the runtime environment
+- Dependencies from `requirements.txt`
 
 ### Running Locally
+
 ```bash
 pip install -r requirements.txt
-python app.py
+cp .env.example .env
+uvicorn bot_app.main:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
-### Packaging
+### Publishing Preauthorization
+
 ```bash
-pyinstaller build.spec
+python tools/preauthorize_publishers.py --skip-tiktok --youtube-client-secret client_secret.json
+python tools/preauthorize_publishers.py --skip-youtube --tiktok-client-key "<client-key>" --tiktok-client-secret "<client-secret>"
 ```
+
+See `docs/PREAUTHORIZATION.md`.
 
 ## 📝 Coding Standards & Conventions
-- **Type Hinting**: Encouraged for core logic methods (e.g., `def process(self, url: str) -> dict`).
-- **Error Handling**: 
-  - GUI should never crash. Catch exceptions and show `messagebox.showerror`.
-  - Log errors to `error.log` using `utils.logger`.
-- **Async/Threading**: strictly use `threading.Thread` for blocking I/O (network/disk) to prevent freezing the `tkinter` main loop.
-- **Config**: Always access/save settings via `self.config` in `app.py` or pass config dicts to `clipper_core.py`.
+
+- Use Bot Control Mode domain terms from `CONTEXT.md`.
+- Prefer small, focused changes and preserve existing contracts.
+- Add Alembic migrations for model/schema changes.
+- Keep Telegram commands behind the Authorized Operator guard.
+- Do not log secrets, tokens, credentials, raw cookies, or private payloads.
+- Environment Configuration belongs in `.env`/`bot_app/settings.py`; runtime Workflow Defaults belong in SQLite.
+- For video processing, avoid broad rewrites of `clipper_core.py`; prefer adapters/services around it.
+- Avoid reintroducing Tkinter/CustomTkinter, desktop pages/dialogs, `app.py`, pywebview, or PyInstaller build specs.
+
+## ✅ Testing and Verification
+
+Preferred checks:
+
+```bash
+pytest -q
+python -m py_compile bot_app/*.py tools/preauthorize_publishers.py clipper_core.py youtube_uploader.py tiktok_uploader.py utils/*.py
+```
+
+When changing migrations, verify initialization through existing tests or a temporary SQLite database.
 
 ## 🤖 AI Agent Tips
-- When modifying `clipper_core.py`, be mindful of the huge method size. Consider breaking down `process_clip` if adding complexity.
-- **Prompt Engineering**: Changes to logic often require changes to `SYSTEM_PROMPT.md`. Check that file if highlight quality degrades.
-- **Dependencies**: `utils/dependency_manager.py` handles auto-downloading binaries (ffmpeg/yt-dlp) for end-users. Do not break this flow.
 
-## Agent skills
+- Read `CONTEXT.md` and relevant ADRs before implementing Bot Control Mode changes.
+- `tests/test_combined_bot_server.py` covers most Bot Control workflows.
+- `tests/test_bot_control_mode_parity.py` prevents legacy desktop GUI artifacts from returning.
+- If adding Telegram behavior, test handlers with fake updates/contexts rather than live Telegram API calls.
+- If adding video or publishing behavior, use fake processors/publishers in tests; do not call FFmpeg, Gemini, OpenRouter, YouTube, or TikTok in unit tests.
+
+## Agent Skills
 
 ### Issue tracker
 
@@ -114,6 +169,8 @@ Triage labels use the default canonical vocabulary. See `docs/agents/triage-labe
 Domain docs use a single-context layout. See `docs/agents/domain.md`.
 
 ## 🔗 Related Documentation
-- `README.md`: General user info.
-- `GUIDE.md`: Detailed usage guide.
-- `BUILD.md`: Detailed build instructions (PyInstaller).
+
+- `README.md`: Bot Control Mode setup and operation.
+- `CONTEXT.md`: Domain glossary.
+- `docs/PREAUTHORIZATION.md`: YouTube/TikTok preauthorization setup.
+- `docs/adr/`: Architecture decisions.
