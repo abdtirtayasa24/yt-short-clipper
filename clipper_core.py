@@ -3190,8 +3190,24 @@ Transcript:
             raise Exception(f"TTS (Hook) generation failed!\n\nError: {type(e).__name__}: {e}\nModel: {self.tts_model}")
         
         tts_file = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False).name
-        with open(tts_file, 'wb') as f:
-            f.write(tts_response.content)
+        tts_content = getattr(tts_response, "content", b"") or b""
+        if tts_content:
+            with open(tts_file, 'wb') as f:
+                f.write(tts_content)
+        else:
+            self.log("  ⚠ TTS provider returned empty audio; using silent hook audio")
+            silent_cmd = [
+                self.ffmpeg_path, "-y",
+                "-f", "lavfi",
+                "-i", "anullsrc=r=44100:cl=mono",
+                "-t", "3",
+                "-q:a", "9",
+                "-acodec", "libmp3lame",
+                tts_file,
+            ]
+            silent_result = subprocess.run(silent_cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
+            if silent_result.returncode != 0:
+                raise Exception(f"Failed to create silent hook audio:\n{silent_result.stderr}")
         
         # Get TTS duration using ffprobe
         probe_cmd = [
@@ -4151,8 +4167,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             raise Exception(f"TTS (Hook) generation failed!\n\nError: {type(e).__name__}: {e}\nModel: {self.tts_model}")
         
         tts_file = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False).name
-        with open(tts_file, 'wb') as f:
-            f.write(tts_response.content)
+        tts_content = getattr(tts_response, "content", b"") or b""
+        if tts_content:
+            with open(tts_file, 'wb') as f:
+                f.write(tts_content)
+        else:
+            self.log("  ⚠ TTS provider returned empty audio; using silent hook audio")
+            silent_cmd = [
+                self.ffmpeg_path, "-y",
+                "-f", "lavfi",
+                "-i", "anullsrc=r=44100:cl=mono",
+                "-t", "3",
+                "-q:a", "9",
+                "-acodec", "libmp3lame",
+                tts_file,
+            ]
+            silent_result = subprocess.run(silent_cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
+            if silent_result.returncode != 0:
+                raise Exception(f"Failed to create silent hook audio:\n{silent_result.stderr}")
         
         progress_callback(0.2)
         
