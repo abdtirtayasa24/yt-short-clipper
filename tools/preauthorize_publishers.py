@@ -15,6 +15,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+YOUTUBE_SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube.readonly",
+]
+
 
 class JsonConfigStore:
     """Minimal config interface required by TikTokUploader."""
@@ -39,21 +46,43 @@ class JsonConfigStore:
         self.path.write_text(json.dumps(self.config, indent=2))
 
 
-def preauthorize_youtube(client_secret_path: Path, output_path: Path) -> None:
+def _load_youtube_client_config(client_secret_path: Path, oauth_port: int) -> dict[str, Any]:
     if not client_secret_path.exists():
         raise FileNotFoundError(f"YouTube client secret file not found: {client_secret_path}")
 
-    import youtube_uploader
-    from youtube_uploader import YouTubeUploader
+    config = json.loads(client_secret_path.read_text())
+    if "installed" in config:
+        return config
 
+    if "web" in config:
+        redirect_uri = f"http://localhost:{oauth_port}/"
+        configured_redirects = config["web"].get("redirect_uris", [])
+        if redirect_uri not in configured_redirects:
+            raise ValueError(
+                "YouTube OAuth client_secret.json is a Web application client, but its redirect URIs do not include "
+                f"{redirect_uri!r}. Add that exact URI in Google Cloud Console, or create an OAuth client of type "
+                "Desktop app and download that client_secret.json instead."
+            )
+        return config
+
+    raise ValueError(
+        "Unsupported YouTube client_secret.json. Expected a Google OAuth client containing either "
+        "an 'installed' Desktop app client or a 'web' client."
+    )
+
+
+def preauthorize_youtube(client_secret_path: Path, output_path: Path, oauth_port: int) -> None:
+    client_config = _load_youtube_client_config(client_secret_path, oauth_port)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    youtube_uploader.CLIENT_SECRET_FILE = client_secret_path
-    youtube_uploader.CREDENTIALS_FILE = output_path
 
-    uploader = YouTubeUploader(status_callback=print)
-    uploader.authenticate()
-    if not output_path.exists():
-        raise RuntimeError(f"YouTube authentication finished but did not write {output_path}")
+    print(f"Opening YouTube OAuth browser flow on http://localhost:{oauth_port}/")
+    flow = InstalledAppFlow.from_client_config(client_config, YOUTUBE_SCOPES)
+    credentials = flow.run_local_server(
+        port=oauth_port,
+        prompt="consent",
+        success_message="YouTube connected successfully. You can close this window.",
+    )
+    output_path.write_text(credentials.to_json())
     print(f"✓ YouTube credentials written to {output_path}")
 
 
@@ -63,11 +92,15 @@ def preauthorize_tiktok(
     mode: str,
     output_path: Path,
     working_config_path: Path,
+    redirect_uri: str,
 ) -> None:
     if not client_key or not client_secret:
         raise ValueError("TikTok client key and client secret are required")
 
+    import tiktok_uploader
     from tiktok_uploader import TikTokUploader
+
+    tiktok_uploader.REDIRECT_URI = redirect_uri
 
     config = JsonConfigStore(
         working_config_path,
@@ -83,6 +116,7 @@ def preauthorize_tiktok(
     tiktok_config.update({"client_key": client_key, "client_secret": client_secret, "mode": mode})
     config.set("tiktok", tiktok_config)
 
+    print(f"Opening TikTok OAuth browser flow with redirect URI: {tiktok_uploader.REDIRECT_URI}")
     uploader = TikTokUploader(config, status_callback=print)
     uploader.authenticate()
 
@@ -97,10 +131,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=Path("credentials"), help="Directory for generated auth files")
     parser.add_argument("--youtube-client-secret", type=Path, default=Path("client_secret.json"), help="Google OAuth client_secret.json path")
+    parser.add_argument("--youtube-oauth-port", type=int, default=8080, help="Localhost port for YouTube OAuth callback")
     parser.add_argument("--skip-youtube", action="store_true", help="Do not run YouTube OAuth")
     parser.add_argument("--tiktok-client-key", default="", help="TikTok app client key")
     parser.add_argument("--tiktok-client-secret", default="", help="TikTok app client secret")
     parser.add_argument("--tiktok-mode", choices=["sandbox", "production"], default="sandbox", help="TikTok API mode")
+    parser.add_argument("--tiktok-redirect-uri", default="http://localhost:8080/callback", help="TikTok OAuth redirect URI; must exactly match TikTok Developer Console")
     parser.add_argument("--skip-tiktok", action="store_true", help="Do not run TikTok OAuth")
     parser.add_argument("--copy-env-example", action="store_true", help="Print .env paths for the generated files")
     return parser.parse_args()
@@ -114,7 +150,7 @@ def main() -> None:
     tiktok_working_config = output_dir / ".tiktok-preauth-config.json"
 
     if not args.skip_youtube:
-        preauthorize_youtube(args.youtube_client_secret, youtube_output)
+        preauthorize_youtube(args.youtube_client_secret, youtube_output, args.youtube_oauth_port)
     else:
         print("- Skipped YouTube preauthorization")
 
@@ -125,6 +161,7 @@ def main() -> None:
             args.tiktok_mode,
             tiktok_output,
             tiktok_working_config,
+            args.tiktok_redirect_uri,
         )
     else:
         print("- Skipped TikTok preauthorization")
