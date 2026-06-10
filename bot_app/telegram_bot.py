@@ -5,6 +5,7 @@ from telegram.ext import Application, ApplicationBuilder, CommandHandler, Contex
 
 from bot_app.database import create_session_factory, ensure_workflow_defaults
 from bot_app.manual_clipping import ManualClippingService
+from bot_app.scheduler import add_daily_schedule, add_weekly_schedule, list_schedules, remove_schedule
 from bot_app.settings import Settings
 from bot_app.source_queue import add_source_videos, cancel_pending_source_video, get_source_videos
 
@@ -42,6 +43,7 @@ class AuthorizedOperatorTelegramBot:
         self.application.add_handler(CommandHandler("defaults", self.handle_defaults))
         self.application.add_handler(CommandHandler("sources", self.handle_sources))
         self.application.add_handler(CommandHandler("clip", self.handle_clip))
+        self.application.add_handler(CommandHandler("schedule", self.handle_schedule))
         self.started = True
 
     async def stop(self) -> None:
@@ -69,7 +71,7 @@ class AuthorizedOperatorTelegramBot:
     async def handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
             return False
-        await update.message.reply_text("Available commands: /start, /help, /status, /defaults, /sources, /clip")
+        await update.message.reply_text("Available commands: /start, /help, /status, /defaults, /sources, /clip, /schedule")
         return True
 
     async def handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -77,6 +79,54 @@ class AuthorizedOperatorTelegramBot:
             return False
         await update.message.reply_text("Bot Control Mode status: ok")
         return True
+
+    async def handle_schedule(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        if await self._reject_unknown_chat(update):
+            return False
+
+        args = list(getattr(context, "args", []) or [])
+        with self.session_factory() as session:
+            if args == ["list"]:
+                await update.message.reply_text(self._format_schedules(session))
+                return True
+            if len(args) == 3 and args[0] == "add" and args[1] == "daily":
+                slot = add_daily_schedule(session, self.settings, args[2])
+                if slot is not None:
+                    await update.message.reply_text(f"Added daily schedule {slot.id} at {slot.local_time} {slot.timezone}.")
+                    return True
+            if len(args) == 4 and args[0] == "add" and args[1] == "weekly":
+                slot = add_weekly_schedule(session, self.settings, args[2], args[3])
+                if slot is not None:
+                    await update.message.reply_text(
+                        f"Added weekly schedule {slot.id} on {slot.weekday} at {slot.local_time} {slot.timezone}."
+                    )
+                    return True
+            if len(args) == 2 and args[0] == "remove" and args[1].isdigit():
+                if remove_schedule(session, int(args[1])):
+                    await update.message.reply_text(f"Removed schedule {args[1]}.")
+                    return True
+
+        await update.message.reply_text(self._schedule_usage())
+        return False
+
+    def _format_schedules(self, session) -> str:
+        schedules = list_schedules(session)
+        if not schedules:
+            return "No schedules configured."
+        lines = ["Schedules:"]
+        for slot in schedules:
+            state = "enabled" if slot.enabled else "disabled"
+            if slot.cadence == "weekly":
+                lines.append(f"#{slot.id} weekly {slot.weekday} {slot.local_time} {slot.timezone} {state}")
+            else:
+                lines.append(f"#{slot.id} daily {slot.local_time} {slot.timezone} {state}")
+        return "\n".join(lines)
+
+    def _schedule_usage(self) -> str:
+        return (
+            "Usage: /schedule add daily <HH:MM>, "
+            "/schedule add weekly <weekday> <HH:MM>, /schedule list, or /schedule remove <schedule_id>"
+        )
 
     async def handle_clip(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):

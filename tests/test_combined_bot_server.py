@@ -11,6 +11,7 @@ from bot_app.manual_clipping import HighlightDraft, ManualClippingService, Publi
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
 from bot_app.models import ClipRecord, HighlightCandidate, RunEvent, RunLog, WorkflowDefaults
+from bot_app.scheduler import fire_schedule
 from bot_app.source_queue import consume_source_video, get_pending_source_videos
 from bot_app.settings import Settings
 from bot_app.telegram_bot import AuthorizedOperatorTelegramBot
@@ -341,6 +342,55 @@ def test_source_queue_consumes_pending_videos_once_and_rejects_unknown_chats(tmp
         assert "consumed" in list_update.message.replies[0]
 
     asyncio.run(run_test())
+
+
+def test_authorized_operator_can_add_list_and_remove_schedule_slots(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+
+        daily_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_schedule(daily_update, FakeContext(["add", "daily", "09:30"])) is True
+        assert "Added daily schedule" in daily_update.message.replies[0]
+        assert "Asia/Jakarta" in daily_update.message.replies[0]
+
+        weekly_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_schedule(weekly_update, FakeContext(["add", "weekly", "monday", "10:15"])) is True
+        assert "Added weekly schedule" in weekly_update.message.replies[0]
+
+        list_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_schedule(list_update, FakeContext(["list"])) is True
+        assert "daily 09:30 Asia/Jakarta enabled" in list_update.message.replies[0]
+        assert "weekly monday 10:15 Asia/Jakarta enabled" in list_update.message.replies[0]
+
+        remove_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_schedule(remove_update, FakeContext(["remove", "1"])) is True
+        assert "Removed schedule 1" in remove_update.message.replies[0]
+
+    asyncio.run(run_test())
+
+
+def test_scheduled_firing_consumes_one_source_video_and_empty_queue_is_silent(tmp_path):
+    settings = make_settings(tmp_path)
+    initialize_database(settings.database_url)
+    session_factory = create_session_factory(settings.database_url)
+
+    with session_factory() as session:
+        from bot_app.source_queue import add_source_videos
+
+        add_source_videos(session, ["https://youtu.be/one", "https://youtu.be/two"])
+        result = fire_schedule(session, settings, schedule_id=1)
+        assert result.message_telegram is True
+        assert result.source_url == "https://youtu.be/one"
+        assert len(get_pending_source_videos(session)) == 1
+
+        empty_source = get_pending_source_videos(session)[0]
+        consume_source_video(session, empty_source)
+        empty_result = fire_schedule(session, settings, schedule_id=1)
+        assert empty_result.message_telegram is False
+        assert empty_result.source_url is None
+        assert len(session.scalars(select(RunLog)).all()) == 2
 
 
 def test_authorized_operator_can_view_and_update_workflow_defaults(tmp_path):

@@ -9,6 +9,24 @@ class Base(DeclarativeBase):
     pass
 
 
+class ScheduleSlot(Base):
+    """Enabled daily or weekly Scheduled Source URL slot."""
+
+    __tablename__ = "schedule_slots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cadence: Mapped[str] = mapped_column(String(16), nullable=False)
+    weekday: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    local_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 class RunLog(Base):
     """Persistent record of a Bot Control Mode clipping run."""
 
