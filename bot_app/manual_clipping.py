@@ -1,8 +1,14 @@
+import ipaddress
 import json
+import re
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlparse
+from urllib.request import Request, urlopen
 
 from openai import OpenAI
 
@@ -32,12 +38,25 @@ class HighlightDraft:
     description: str
 
 
+@dataclass
+class DirectVideoSource:
+    path: Path
+    filename: str
+    content_type: str | None
+    file_size: int
+
+
+SUPPORTED_DIRECT_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+
+
 class HighlightFinder(Protocol):
     def find_highlights(
         self,
-        youtube_url: str,
+        source_url: str,
         count: int,
         subtitle_language: str = "en",
+        *,
+        source_path: Path | None = None,
     ) -> list[HighlightDraft]:
         ...
 
@@ -163,6 +182,7 @@ class ClipProcessor(Protocol):
         *,
         captions_enabled: bool,
         hooks_enabled: bool,
+        source_path: Path | None = None,
     ) -> Path:
         ...
 
@@ -178,6 +198,7 @@ class ExistingClipProcessor:
         *,
         captions_enabled: bool,
         hooks_enabled: bool,
+        source_path: Path | None = None,
     ) -> Path:
         from clipper_core import AutoClipperCore
 
@@ -212,12 +233,20 @@ class ExistingClipProcessor:
         highlight = _candidate_to_core_highlight(candidate)
         section_path = output_dir / "_temp" / f"run_{candidate.run_id}_candidate_{candidate.candidate_number}.mp4"
         section_path.parent.mkdir(parents=True, exist_ok=True)
-        video_path = core.download_video_section(
-            source_url,
-            highlight["start_time"],
-            highlight["end_time"],
-            str(section_path),
-        )
+        if source_path is not None:
+            video_path = self._cut_local_video_section(
+                source_path,
+                highlight["start_time"],
+                highlight["end_time"],
+                section_path,
+            )
+        else:
+            video_path = core.download_video_section(
+                source_url,
+                highlight["start_time"],
+                highlight["end_time"],
+                str(section_path),
+            )
         before = set(output_dir.glob("*/master.mp4"))
         core.process_clip(
             video_path,
@@ -236,6 +265,51 @@ class ExistingClipProcessor:
             raise RuntimeError("Clip processing finished without creating master.mp4")
         return created[0]
 
+    def _cut_local_video_section(
+        self,
+        source_path: Path,
+        start_time: str,
+        end_time: str,
+        output_path: Path,
+    ) -> str:
+        from utils.helpers import get_ffmpeg_path
+
+        ffmpeg_path = get_ffmpeg_path()
+        if not ffmpeg_path:
+            raise RuntimeError("FFmpeg is required to process direct video URLs")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            str(ffmpeg_path),
+            "-y",
+            "-ss",
+            start_time.replace(",", "."),
+            "-to",
+            end_time.replace(",", "."),
+            "-i",
+            str(source_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "18",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            str(output_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg failed to cut direct video section:\n{result.stderr}")
+        if not output_path.exists():
+            raise RuntimeError(f"Direct video section was not created at {output_path}")
+        return str(output_path)
+
 
 class ClippingQueue:
     def __init__(self):
@@ -252,6 +326,118 @@ class ClippingQueue:
             self.active_run_id = None
 
 
+class DirectVideoIngestor:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    def is_direct_video_url(self, source_url: str) -> bool:
+        parsed = urlparse(source_url)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        return Path(unquote(parsed.path)).suffix.lower() in SUPPORTED_DIRECT_VIDEO_EXTENSIONS
+
+    def download(self, source_url: str, run_id: int) -> DirectVideoSource:
+        parsed = urlparse(source_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Direct video URL must be an HTTP(S) URL")
+        if parsed.username or parsed.password:
+            raise ValueError("Direct video URL must not include credentials")
+        self._validate_public_host(parsed.hostname)
+
+        filename = self._safe_filename(Path(unquote(parsed.path)).name or f"source-{run_id}.mp4")
+        suffix = Path(filename).suffix.lower()
+        if suffix not in SUPPORTED_DIRECT_VIDEO_EXTENSIONS:
+            raise ValueError("Direct video URL must point to a supported video file")
+
+        request = Request(source_url, headers={"User-Agent": "yt-short-clipper/1.0"})
+        try:
+            with urlopen(request, timeout=30) as response:
+                headers = response.headers
+                content_type = self._header_value(headers, "Content-Type")
+                normalized_content_type = content_type.split(";", 1)[0].strip().lower() if content_type else None
+                content_length = self._header_value(headers, "Content-Length")
+                content_length_bytes = self._parse_content_length(content_length)
+                if content_length_bytes and content_length_bytes > self.settings.source_video_max_bytes:
+                    raise ValueError(
+                        f"Direct video is too large. Limit is {self.settings.source_video_max_bytes} bytes."
+                    )
+                if not self._is_supported_video_response(normalized_content_type, suffix):
+                    raise ValueError("Direct video URL did not return a supported video content type")
+
+                run_dir = self.settings.source_video_dir / str(run_id)
+                run_dir.mkdir(parents=True, exist_ok=True)
+                target_path = run_dir / filename
+                bytes_written = 0
+                with open(target_path, "wb") as output:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        bytes_written += len(chunk)
+                        if bytes_written > self.settings.source_video_max_bytes:
+                            output.close()
+                            target_path.unlink(missing_ok=True)
+                            raise ValueError(
+                                f"Direct video is too large. Limit is {self.settings.source_video_max_bytes} bytes."
+                            )
+                        output.write(chunk)
+        except (HTTPError, URLError) as exc:
+            raise ValueError(f"Failed to download direct video URL: {exc}") from exc
+
+        if bytes_written == 0:
+            target_path.unlink(missing_ok=True)
+            raise ValueError("Direct video URL downloaded an empty file")
+
+        return DirectVideoSource(
+            path=target_path,
+            filename=filename,
+            content_type=normalized_content_type,
+            file_size=bytes_written,
+        )
+
+    def _validate_public_host(self, hostname: str | None) -> None:
+        host = (hostname or "").lower()
+        if host == "localhost":
+            raise ValueError("Direct video URL must not point to localhost")
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return
+        if not address.is_global:
+            raise ValueError("Direct video URL must point to a public host")
+
+    def _header_value(self, headers, name: str) -> str | None:
+        value = headers.get(name)
+        if value is None:
+            value = headers.get(name.lower())
+        return value
+
+    def _parse_content_length(self, content_length: str | None) -> int | None:
+        if not content_length:
+            return None
+        try:
+            value = int(content_length)
+        except ValueError as exc:
+            raise ValueError("Direct video URL returned an invalid Content-Length header") from exc
+        if value < 0:
+            raise ValueError("Direct video URL returned an invalid Content-Length header")
+        return value
+
+    def _is_supported_video_response(self, content_type: str | None, suffix: str) -> bool:
+        if content_type is None:
+            return suffix in SUPPORTED_DIRECT_VIDEO_EXTENSIONS
+        if content_type.startswith("video/"):
+            return True
+        return content_type == "application/octet-stream" and suffix in SUPPORTED_DIRECT_VIDEO_EXTENSIONS
+
+    def _safe_filename(self, filename: str) -> str:
+        name = Path(filename).name
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip("._")
+        if not name:
+            name = "source.mp4"
+        return name
+
+
 class GeminiHighlightFinder:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -259,11 +445,16 @@ class GeminiHighlightFinder:
 
     def find_highlights(
         self,
-        youtube_url: str,
+        source_url: str,
         count: int,
         subtitle_language: str = "en",
+        *,
+        source_path: Path | None = None,
     ) -> list[HighlightDraft]:
-        transcript, video_info = self._load_transcript(youtube_url, subtitle_language)
+        if source_path is None:
+            transcript, video_info = self._load_transcript(source_url, subtitle_language)
+        else:
+            transcript, video_info = self._load_local_transcript(source_path)
         prompt = (
             f"Find {count} short-form highlight candidates from the transcript below. "
             "Use only the transcript and metadata provided; do not invent topics that are not present. "
@@ -271,7 +462,7 @@ class GeminiHighlightFinder:
             "hook_text, and description. Times must come from the transcript and use HH:MM:SS,mmm.\n\n"
             f"Video title: {video_info.get('title', '')}\n"
             f"Channel: {video_info.get('channel', '')}\n"
-            f"URL: {youtube_url}\n\n"
+            f"URL: {source_url}\n\n"
             f"Transcript:\n{transcript}"
         )
         raw_response = self.provider.generate_text(prompt)
@@ -320,6 +511,41 @@ class GeminiHighlightFinder:
             raise ValueError("Subtitle transcript is empty")
         return transcript, video_info or {}
 
+    def _load_local_transcript(self, source_path: Path) -> tuple[str, dict]:
+        from clipper_core import AutoClipperCore
+
+        if not self.settings.openrouter_api_key:
+            raise ValueError("OpenRouter transcription is required for direct video URLs")
+        work_dir = Path("data/manual_clipping")
+        work_dir.mkdir(parents=True, exist_ok=True)
+        core = AutoClipperCore(
+            client=OpenAI(api_key=self.settings.openrouter_api_key, base_url="https://openrouter.ai/api/v1"),
+            output_dir=str(work_dir),
+            ytdlp_path="yt_dlp_module",
+            subtitle_language="none",
+            ai_providers={
+                "highlight_finder": {
+                    "api_key": self.settings.openrouter_api_key,
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": self.settings.openrouter_transcription_model,
+                },
+                "caption_maker": {
+                    "api_key": self.settings.openrouter_api_key,
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": self.settings.openrouter_transcription_model,
+                },
+                "hook_maker": {
+                    "api_key": self.settings.openrouter_api_key,
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": self.settings.openrouter_tts_model,
+                },
+            },
+        )
+        transcript = core.transcribe_full_video(str(source_path))
+        if not transcript.strip():
+            raise ValueError("Direct video transcription is empty")
+        return transcript, {"title": source_path.name, "channel": ""}
+
 
 class ManualClippingService:
     def __init__(
@@ -331,6 +557,7 @@ class ManualClippingService:
         metadata_generator: MetadataGenerator | None = None,
         youtube_publisher: Publisher | None = None,
         tiktok_publisher: Publisher | None = None,
+        direct_video_ingestor: DirectVideoIngestor | None = None,
     ):
         self.settings = settings
         self.highlight_finder = highlight_finder or GeminiHighlightFinder(settings)
@@ -339,21 +566,40 @@ class ManualClippingService:
         self.metadata_generator = metadata_generator or GeminiMetadataGenerator(settings)
         self.youtube_publisher = youtube_publisher
         self.tiktok_publisher = tiktok_publisher
+        self.direct_video_ingestor = direct_video_ingestor or DirectVideoIngestor(settings)
 
-    def start_run(self, session: Session, youtube_url: str) -> RunLog:
+    def start_run(self, session: Session, source_url: str) -> RunLog:
         defaults = ensure_workflow_defaults(session)
-        run = RunLog(source_url=youtube_url, status="finding_highlights")
+        source_type = "direct_video_url" if self.direct_video_ingestor.is_direct_video_url(source_url) else "youtube"
+        run = RunLog(source_url=source_url, source_type=source_type, status="finding_highlights")
         session.add(run)
         session.commit()
         session.refresh(run)
         self.add_event(session, run, "started", "Manual Clipping started")
 
         try:
-            drafts = self.highlight_finder.find_highlights(
-                youtube_url,
-                defaults.manual_highlight_candidates,
-                defaults.subtitle_language,
-            )
+            source_path = None
+            if source_type == "direct_video_url":
+                direct_source = self.direct_video_ingestor.download(source_url, run.id)
+                run.source_path = str(direct_source.path)
+                run.source_filename = direct_source.filename
+                run.source_content_type = direct_source.content_type
+                run.source_file_size = direct_source.file_size
+                source_path = direct_source.path
+                self.add_event(session, run, "source_downloaded", f"Downloaded direct video URL to {direct_source.filename}")
+            if source_path is None:
+                drafts = self.highlight_finder.find_highlights(
+                    source_url,
+                    defaults.manual_highlight_candidates,
+                    defaults.subtitle_language,
+                )
+            else:
+                drafts = self.highlight_finder.find_highlights(
+                    source_url,
+                    defaults.manual_highlight_candidates,
+                    defaults.subtitle_language,
+                    source_path=source_path,
+                )
             for index, draft in enumerate(drafts, start=1):
                 session.add(
                     HighlightCandidate(
@@ -421,12 +667,22 @@ class ManualClippingService:
                     self.add_event(session, run, "cancelled", "Run cancelled before next clipping step")
                     session.commit()
                     return []
-                output_path = self.clip_processor.process_highlight(
-                    run.source_url,
-                    candidate,
-                    captions_enabled=defaults.captions_enabled,
-                    hooks_enabled=defaults.hooks_enabled,
-                )
+                source_path = Path(run.source_path) if run.source_path else None
+                if source_path is None:
+                    output_path = self.clip_processor.process_highlight(
+                        run.source_url,
+                        candidate,
+                        captions_enabled=defaults.captions_enabled,
+                        hooks_enabled=defaults.hooks_enabled,
+                    )
+                else:
+                    output_path = self.clip_processor.process_highlight(
+                        run.source_url,
+                        candidate,
+                        captions_enabled=defaults.captions_enabled,
+                        hooks_enabled=defaults.hooks_enabled,
+                        source_path=source_path,
+                    )
                 metadata = self.metadata_generator.generate_metadata(
                     run.source_url,
                     candidate,

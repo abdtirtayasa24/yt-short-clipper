@@ -25,7 +25,10 @@ def make_settings(tmp_path: Path) -> Settings:
         telegram_authorized_chat_id=123456,
         gemini_api_key="gemini-test-key",
         openrouter_api_key="openrouter-test-key",
+        openrouter_tts_model="canopylabs/orpheus-3b-0.1-ft",
+        openrouter_tts_voice="josh",
         clip_archive_dir=tmp_path / "clips",
+        source_video_dir=tmp_path / "source_videos",
     )
 
 
@@ -266,6 +269,48 @@ class FakeHighlightFinder:
         ]
 
 
+class FakeDirectVideoHighlightFinder:
+    def __init__(self):
+        self.calls = []
+
+    def find_highlights(self, source_url, count, subtitle_language="en", *, source_path=None):
+        self.calls.append((source_url, count, subtitle_language, source_path))
+        assert source_path is not None
+        assert Path(source_path).exists()
+        return [
+            HighlightDraft(
+                title="Direct video moment",
+                start_time="00:00:01,000",
+                end_time="00:00:11,000",
+                virality_score=8,
+                hook_text="Direct hook",
+                description="A direct video highlight",
+            )
+        ]
+
+
+class FakeHttpResponse:
+    def __init__(self, body: bytes, headers: dict[str, str]):
+        self.body = body
+        self.headers = headers
+        self.offset = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self, size=-1):
+        if self.offset >= len(self.body):
+            return b""
+        if size is None or size < 0:
+            size = len(self.body) - self.offset
+        chunk = self.body[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+
 def test_gemini_highlight_finder_accepts_fenced_json_response():
     class FakeProvider:
         def generate_text(self, prompt):
@@ -303,6 +348,49 @@ def test_gemini_highlight_finder_accepts_fenced_json_response():
     ]
 
 
+def test_gemini_highlight_finder_uses_local_transcript_for_direct_video(tmp_path):
+    class FakeProvider:
+        def __init__(self):
+            self.prompts = []
+
+        def generate_text(self, prompt):
+            self.prompts.append(prompt)
+            return """[
+  {
+    "title": "Local moment",
+    "start_time": "00:00:02,000",
+    "end_time": "00:00:12,000",
+    "virality_score": 7,
+    "hook_text": "Local hook",
+    "description": "A local video highlight"
+  }
+]"""
+
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"video")
+    finder = GeminiHighlightFinder.__new__(GeminiHighlightFinder)
+    finder.provider = FakeProvider()
+    finder._load_local_transcript = lambda path: (
+        "00:00:02,000 --> 00:00:12,000 A local transcript line",
+        {"title": "source.mp4", "channel": ""},
+    )
+
+    highlights = finder.find_highlights("https://media.example.com/source.mp4", 1, source_path=source_path)
+
+    assert highlights == [
+        HighlightDraft(
+            title="Local moment",
+            start_time="00:00:02,000",
+            end_time="00:00:12,000",
+            virality_score=7,
+            hook_text="Local hook",
+            description="A local video highlight",
+        )
+    ]
+    assert "A local transcript line" in finder.provider.prompts[0]
+    assert "https://media.example.com/source.mp4" in finder.provider.prompts[0]
+
+
 def test_clip_start_failure_replies_and_records_failed_run(tmp_path):
     async def run_test():
         settings = make_settings(tmp_path)
@@ -320,6 +408,127 @@ def test_clip_start_failure_replies_and_records_failed_run(tmp_path):
             run = session.scalars(select(RunLog)).one()
             assert run.status == "failed"
             assert "Gemini did not return valid highlight JSON" in run.error_message
+
+    asyncio.run(run_test())
+
+
+def test_authorized_operator_can_start_direct_video_url_manual_clipping(monkeypatch, tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        finder = FakeDirectVideoHighlightFinder()
+        service = ManualClippingService(settings, finder)
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        def fake_urlopen(request, timeout=30):
+            return FakeHttpResponse(
+                b"fake mp4 bytes",
+                {"Content-Type": "video/mp4", "Content-Length": "14"},
+            )
+
+        monkeypatch.setattr("bot_app.manual_clipping.urlopen", fake_urlopen)
+
+        update = FakeUpdate(settings.telegram_authorized_chat_id)
+        direct_url = "https://media.example.com/videos/source.mp4"
+        assert await bot.handle_clip(update, FakeContext([direct_url])) is True
+        assert "Run Log 1 highlight candidates" in update.message.replies[0]
+        assert "Direct video moment" in update.message.replies[0]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            run = session.scalars(select(RunLog)).one()
+            assert run.source_url == direct_url
+            assert run.source_type == "direct_video_url"
+            assert run.source_content_type == "video/mp4"
+            assert run.source_file_size == 14
+            assert run.source_filename == "source.mp4"
+            assert run.source_path is not None
+            assert Path(run.source_path).exists()
+            assert Path(run.source_path).read_bytes() == b"fake mp4 bytes"
+
+        assert len(finder.calls) == 1
+        assert finder.calls[0][0:3] == (direct_url, 5, "en")
+
+    asyncio.run(run_test())
+
+
+def test_direct_video_url_rejects_non_video_response(monkeypatch, tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        service = ManualClippingService(settings, FakeDirectVideoHighlightFinder())
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        def fake_urlopen(request, timeout=30):
+            return FakeHttpResponse(
+                b"<html>not a video</html>",
+                {"Content-Type": "text/html", "Content-Length": "24"},
+            )
+
+        monkeypatch.setattr("bot_app.manual_clipping.urlopen", fake_urlopen)
+
+        update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(update, FakeContext(["https://media.example.com/not-video.mp4"])) is False
+        assert "Manual Clipping failed" in update.message.replies[0]
+        assert "supported video content type" in update.message.replies[0]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            run = session.scalars(select(RunLog)).one()
+            assert run.status == "failed"
+            assert run.source_type == "direct_video_url"
+            assert run.source_path is None
+
+    asyncio.run(run_test())
+
+
+def test_direct_video_url_rejects_oversized_response(monkeypatch, tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        settings.source_video_max_bytes = 10
+        initialize_database(settings.database_url)
+        service = ManualClippingService(settings, FakeDirectVideoHighlightFinder())
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        def fake_urlopen(request, timeout=30):
+            return FakeHttpResponse(
+                b"too many bytes",
+                {"Content-Type": "video/mp4", "Content-Length": "14"},
+            )
+
+        monkeypatch.setattr("bot_app.manual_clipping.urlopen", fake_urlopen)
+
+        update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(update, FakeContext(["https://media.example.com/large.mp4"])) is False
+        assert "Manual Clipping failed" in update.message.replies[0]
+        assert "too large" in update.message.replies[0]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            run = session.scalars(select(RunLog)).one()
+            assert run.status == "failed"
+            assert run.source_path is None
+
+    asyncio.run(run_test())
+
+
+def test_direct_video_url_rejects_private_ip_hosts(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        service = ManualClippingService(settings, FakeDirectVideoHighlightFinder())
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(update, FakeContext(["http://169.254.169.254/video.mp4"])) is False
+        assert "Manual Clipping failed" in update.message.replies[0]
+        assert "public host" in update.message.replies[0]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            run = session.scalars(select(RunLog)).one()
+            assert run.status == "failed"
+            assert run.source_type == "direct_video_url"
 
     asyncio.run(run_test())
 
@@ -398,6 +607,21 @@ class FakeClipProcessor:
         output_path = self.output_dir / f"clip-{candidate.candidate_number}.mp4"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(f"clip-{candidate.candidate_number}".encode())
+        return output_path
+
+
+class FakeDirectClipProcessor:
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+        self.calls = []
+
+    def process_highlight(self, source_url, candidate, *, captions_enabled, hooks_enabled, source_path=None):
+        assert source_path is not None
+        assert Path(source_path).exists()
+        self.calls.append((source_url, candidate.candidate_number, captions_enabled, hooks_enabled, source_path))
+        output_path = self.output_dir / f"direct-clip-{candidate.candidate_number}.mp4"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(f"direct-clip-{candidate.candidate_number}".encode())
         return output_path
 
 
@@ -489,6 +713,40 @@ def test_authorized_operator_processes_selected_highlights_into_public_clip_link
             assert len(attempts) == 4
             assert {attempt.platform for attempt in attempts} == {"youtube", "tiktok"}
             assert all(attempt.status == "published" for attempt in attempts)
+
+    asyncio.run(run_test())
+
+
+def test_direct_video_url_selected_highlight_uses_local_source_path(monkeypatch, tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        processor = FakeDirectClipProcessor(settings.clip_archive_dir)
+        service = ManualClippingService(
+            settings,
+            FakeDirectVideoHighlightFinder(),
+            clip_processor=processor,
+            metadata_generator=FakeMetadataGenerator(),
+        )
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        def fake_urlopen(request, timeout=30):
+            return FakeHttpResponse(
+                b"fake mp4 bytes",
+                {"Content-Type": "video/mp4", "Content-Length": "14"},
+            )
+
+        monkeypatch.setattr("bot_app.manual_clipping.urlopen", fake_urlopen)
+
+        direct_url = "https://media.example.com/videos/source.mp4"
+        assert await bot.handle_clip(FakeUpdate(settings.telegram_authorized_chat_id), FakeContext([direct_url])) is True
+        assert await bot.handle_clip(FakeUpdate(settings.telegram_authorized_chat_id), FakeContext(["select", "1", "1"])) is True
+
+        process_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(process_update, FakeContext(["process", "1"])) is True
+        assert "https://clips.example.com/clips/" in process_update.message.replies[0]
+        assert len(processor.calls) == 1
+        assert processor.calls[0][0:4] == (direct_url, 1, True, True)
 
     asyncio.run(run_test())
 

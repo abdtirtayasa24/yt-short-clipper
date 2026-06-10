@@ -273,7 +273,7 @@ class AuthorizedOperatorTelegramBot:
 
     def _clip_usage(self) -> str:
         return (
-            "Usage: /clip <youtube_url>, /clip select <run_id> <numbers...>, "
+            "Usage: /clip <youtube_url_or_direct_video_url>, /clip select <run_id> <numbers...>, "
             "/clip process <run_id>, or /clip cancel <run_id>"
         )
 

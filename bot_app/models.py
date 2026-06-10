@@ -52,6 +52,11 @@ class RunLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False, default="youtube")
+    source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_filename: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
     selected_highlights: Mapped[str | None] = mapped_column(Text, nullable=True)
     cancellation_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

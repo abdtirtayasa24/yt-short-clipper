@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     app_timezone: str = "Asia/Jakarta"
     clip_archive_dir: Path = Path("clip_archive")
     clip_retention_days: int = Field(default=30, ge=1)
+    source_video_dir: Path = Path("data/source_videos")
+    source_video_max_bytes: int = Field(default=500 * 1024 * 1024, ge=1)
     youtube_credentials_path: Path = Path("credentials/youtube.json")
     tiktok_session_path: Path = Path("credentials/tiktok.session")
 
