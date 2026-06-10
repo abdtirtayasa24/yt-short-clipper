@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from bot_app.ai_providers import GeminiTextProvider, OpenRouterAudioAdapter
 from bot_app.clip_archive import create_clip_record
-from bot_app.manual_clipping import HighlightDraft, ManualClippingService
+from bot_app.manual_clipping import HighlightDraft, ManualClippingService, PublishingMetadata
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
 from bot_app.models import ClipRecord, HighlightCandidate, RunEvent, RunLog, WorkflowDefaults
@@ -161,6 +161,19 @@ def test_authorized_operator_can_start_select_and_cancel_manual_clipping(tmp_pat
     asyncio.run(run_test())
 
 
+class FakeMetadataGenerator:
+    def __init__(self):
+        self.calls = []
+
+    def generate_metadata(self, source_url, candidate, model):
+        self.calls.append((source_url, candidate.candidate_number, model))
+        return PublishingMetadata(
+            title=f"Title {candidate.candidate_number}",
+            description=f"Description {candidate.candidate_number}",
+            hashtags=["#shorts", "#viral"],
+        )
+
+
 class FakeClipProcessor:
     def __init__(self, output_dir):
         self.output_dir = output_dir
@@ -180,7 +193,13 @@ def test_authorized_operator_processes_selected_highlights_into_public_clip_link
         initialize_database(settings.database_url)
         finder = FakeHighlightFinder()
         processor = FakeClipProcessor(settings.clip_archive_dir)
-        service = ManualClippingService(settings, finder, clip_processor=processor)
+        metadata_generator = FakeMetadataGenerator()
+        service = ManualClippingService(
+            settings,
+            finder,
+            clip_processor=processor,
+            metadata_generator=metadata_generator,
+        )
         bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
 
         assert await bot.handle_clip(
@@ -197,9 +216,15 @@ def test_authorized_operator_processes_selected_highlights_into_public_clip_link
         reply = process_update.message.replies[0]
         assert "https://clips.example.com/clips/" in reply
         assert "download" in reply
+        assert "Title 1" in reply
+        assert "Title 3" in reply
         assert processor.calls == [
             ("https://youtu.be/manual", 1, True, True),
             ("https://youtu.be/manual", 3, True, True),
+        ]
+        assert metadata_generator.calls == [
+            ("https://youtu.be/manual", 1, "gemini-3.1-flash-lite"),
+            ("https://youtu.be/manual", 3, "gemini-3.1-flash-lite"),
         ]
 
         session_factory = create_session_factory(settings.database_url)
@@ -208,6 +233,9 @@ def test_authorized_operator_processes_selected_highlights_into_public_clip_link
             assert run.status == "processed"
             clips = session.scalars(select(ClipRecord).order_by(ClipRecord.id)).all()
             assert len(clips) == 2
+            assert [clip.generated_title for clip in clips] == ["Title 1", "Title 3"]
+            assert [clip.generated_description for clip in clips] == ["Description 1", "Description 3"]
+            assert all(clip.generated_hashtags == "#shorts #viral" for clip in clips)
             assert all(clip.public_clip_link in reply for clip in clips)
 
     asyncio.run(run_test())
@@ -217,7 +245,12 @@ def test_clipping_queue_allows_only_one_active_run(tmp_path):
     settings = make_settings(tmp_path)
     initialize_database(settings.database_url)
     processor = FakeClipProcessor(settings.clip_archive_dir)
-    service = ManualClippingService(settings, FakeHighlightFinder(), clip_processor=processor)
+    service = ManualClippingService(
+        settings,
+        FakeHighlightFinder(),
+        clip_processor=processor,
+        metadata_generator=FakeMetadataGenerator(),
+    )
     service.clipping_queue.active_run_id = 99
 
     session_factory = create_session_factory(settings.database_url)

@@ -22,6 +22,9 @@ def create_clip_record(
     clip_id: str | None = None,
     expires_at: datetime | None = None,
     deleted_at: datetime | None = None,
+    generated_title: str | None = None,
+    generated_description: str | None = None,
+    generated_hashtags: str | None = None,
 ) -> ClipRecord:
     clip_identifier = clip_id or token_urlsafe(24)
     clip_expires_at = expires_at or datetime.now(timezone.utc) + timedelta(
@@ -31,6 +34,9 @@ def create_clip_record(
         clip_id=clip_identifier,
         archive_path=str(archive_path),
         public_clip_link=build_public_clip_link(settings, clip_identifier),
+        generated_title=generated_title,
+        generated_description=generated_description,
+        generated_hashtags=generated_hashtags,
         expires_at=clip_expires_at,
         deleted_at=deleted_at,
     )

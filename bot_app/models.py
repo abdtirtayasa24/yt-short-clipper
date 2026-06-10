@@ -104,6 +104,9 @@ class ClipRecord(Base):
     clip_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
     archive_path: Mapped[str] = mapped_column(Text, nullable=False)
     public_clip_link: Mapped[str] = mapped_column(Text, nullable=False)
+    generated_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generated_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generated_hashtags: Mapped[str | None] = mapped_column(Text, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

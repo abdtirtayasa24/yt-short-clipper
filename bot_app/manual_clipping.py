@@ -14,6 +14,13 @@ from bot_app.settings import Settings
 
 
 @dataclass
+class PublishingMetadata:
+    title: str
+    description: str
+    hashtags: list[str]
+
+
+@dataclass
 class HighlightDraft:
     title: str
     start_time: str
@@ -26,6 +33,38 @@ class HighlightDraft:
 class HighlightFinder(Protocol):
     def find_highlights(self, youtube_url: str, count: int) -> list[HighlightDraft]:
         ...
+
+
+class MetadataGenerator(Protocol):
+    def generate_metadata(
+        self,
+        source_url: str,
+        candidate: HighlightCandidate,
+        model: str,
+    ) -> PublishingMetadata:
+        ...
+
+
+class GeminiMetadataGenerator:
+    def __init__(self, settings: Settings):
+        self.provider = GeminiTextProvider(settings)
+
+    def generate_metadata(
+        self,
+        source_url: str,
+        candidate: HighlightCandidate,
+        model: str,
+    ) -> PublishingMetadata:
+        prompt = (
+            "Generate shared publishing metadata as JSON with title, description, and hashtags "
+            f"for this clip from {source_url}: {candidate.title}. {candidate.description}"
+        )
+        data = json.loads(self.provider.generate_text(prompt, model=model))
+        return PublishingMetadata(
+            title=data["title"],
+            description=data["description"],
+            hashtags=data.get("hashtags", []),
+        )
 
 
 class ClipProcessor(Protocol):
@@ -88,11 +127,13 @@ class ManualClippingService:
         highlight_finder: HighlightFinder | None = None,
         clip_processor: ClipProcessor | None = None,
         clipping_queue: ClippingQueue | None = None,
+        metadata_generator: MetadataGenerator | None = None,
     ):
         self.settings = settings
         self.highlight_finder = highlight_finder or GeminiHighlightFinder(settings)
         self.clip_processor = clip_processor or ExistingClipProcessor()
         self.clipping_queue = clipping_queue or ClippingQueue()
+        self.metadata_generator = metadata_generator or GeminiMetadataGenerator(settings)
 
     def start_run(self, session: Session, youtube_url: str) -> RunLog:
         defaults = ensure_workflow_defaults(session)
@@ -165,8 +206,20 @@ class ManualClippingService:
                     captions_enabled=defaults.captions_enabled,
                     hooks_enabled=defaults.hooks_enabled,
                 )
-                clip = create_clip_record(session, settings, output_path)
-                links.append(clip.public_clip_link)
+                metadata = self.metadata_generator.generate_metadata(
+                    run.source_url,
+                    candidate,
+                    settings.gemini_youtube_title_model,
+                )
+                clip = create_clip_record(
+                    session,
+                    settings,
+                    output_path,
+                    generated_title=metadata.title,
+                    generated_description=metadata.description,
+                    generated_hashtags=" ".join(metadata.hashtags),
+                )
+                links.append(f"{metadata.title}: {clip.public_clip_link}")
                 self.add_event(session, run, "clip_archived", clip.public_clip_link)
             run.status = "processed"
             self.add_event(session, run, "processed", f"Generated {len(links)} Public Clip Links")
