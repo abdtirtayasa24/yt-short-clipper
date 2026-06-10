@@ -49,6 +49,7 @@ class AuthorizedOperatorTelegramBot:
         self.application.add_handler(CommandHandler("schedule", self.handle_schedule))
         self.application.add_handler(CommandHandler("auth", self.handle_auth))
         self.application.add_handler(CommandHandler("cancel", self.handle_cancel))
+        self.application.add_handler(CallbackQueryHandler(self.handle_sources_callback, pattern=r"^sources:"))
         self.application.add_handler(CallbackQueryHandler(self.handle_defaults_callback, pattern=r"^defaults:"))
         self.application.add_handler(CallbackQueryHandler(self.handle_menu_callback, pattern=r"^menu:"))
         self.application.add_handler(CallbackQueryHandler(self.handle_clip_callback, pattern=r"^clip:"))
@@ -125,7 +126,7 @@ class AuthorizedOperatorTelegramBot:
             )
             return True
         if action == "sources":
-            await query.edit_message_text(self._format_source_videos(), reply_markup=self._home_menu_markup())
+            await query.edit_message_text(self._format_source_videos(), reply_markup=self._source_videos_markup())
             return True
         if action == "schedule":
             with self.session_factory() as session:
@@ -479,8 +480,8 @@ class AuthorizedOperatorTelegramBot:
 
         args = list(getattr(context, "args", []) or [])
         if not args:
-            await update.message.reply_text(self._sources_usage())
-            return False
+            await update.message.reply_text(self._format_source_videos(), reply_markup=self._source_videos_markup())
+            return True
 
         command = args[0]
         if command == "add" and len(args) >= 2:
@@ -490,7 +491,7 @@ class AuthorizedOperatorTelegramBot:
             return True
 
         if command == "list" and len(args) == 1:
-            await update.message.reply_text(self._format_source_videos())
+            await update.message.reply_text(self._format_source_videos(), reply_markup=self._source_videos_markup())
             return True
 
         if command == "remove" and len(args) == 2 and args[1].isdigit():
@@ -503,6 +504,53 @@ class AuthorizedOperatorTelegramBot:
 
         await update.message.reply_text(self._sources_usage())
         return False
+
+    async def handle_sources_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        query = getattr(update, "callback_query", None)
+        if query is None:
+            return False
+        if await self._reject_unknown_chat(update):
+            await query.answer("Unauthorized chat.")
+            return False
+        parts = str(getattr(query, "data", "")).split(":")
+        action = parts[1] if len(parts) >= 2 and parts[0] == "sources" else ""
+        if action == "add":
+            await query.answer()
+            await query.edit_message_text(
+                "Send source URLs with /sources add <url1> [url2 ...].",
+                reply_markup=self._source_videos_markup(),
+            )
+            return True
+        if action == "list":
+            await query.answer()
+            await query.edit_message_text(self._format_source_videos(), reply_markup=self._source_videos_markup())
+            return True
+        if action == "remove" and len(parts) == 3 and parts[2].isdigit():
+            with self.session_factory() as session:
+                removed = cancel_pending_source_video(session, int(parts[2]))
+            await query.answer("Source Video removed." if removed else "Unable to remove Source Video.")
+            await query.edit_message_text(self._format_source_videos(), reply_markup=self._source_videos_markup())
+            return removed
+        await query.answer("Unknown Source Video Queue action.")
+        return False
+
+    def _source_videos_markup(self) -> InlineKeyboardMarkup:
+        rows = [
+            [InlineKeyboardButton("Add Source", callback_data="sources:add")],
+            [InlineKeyboardButton("Refresh Queue", callback_data="sources:list")],
+        ]
+        with self.session_factory() as session:
+            for source in get_source_videos(session):
+                if source.status == "pending":
+                    rows.append(
+                        [
+                            InlineKeyboardButton(
+                                f"Remove #{source.id}",
+                                callback_data=f"sources:remove:{source.id}",
+                            )
+                        ]
+                    )
+        return InlineKeyboardMarkup(rows)
 
     def _format_source_videos(self) -> str:
         with self.session_factory() as session:

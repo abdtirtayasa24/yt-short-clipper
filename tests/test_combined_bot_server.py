@@ -12,7 +12,7 @@ from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
 from bot_app.models import ClipRecord, HighlightCandidate, PublishAttempt, RunEvent, RunLog, WorkflowDefaults
 from bot_app.scheduler import fire_schedule
-from bot_app.source_queue import consume_source_video, get_pending_source_videos
+from bot_app.source_queue import add_source_videos, consume_source_video, get_pending_source_videos
 from bot_app.settings import Settings
 from bot_app.telegram_bot import AuthorizedOperatorTelegramBot
 
@@ -147,7 +147,7 @@ def test_telegram_bot_start_polls_for_updates_and_stop_shuts_down(monkeypatch, t
         await bot.start()
 
         assert bot.started is True
-        assert len(fake_application.handlers) == 13
+        assert len(fake_application.handlers) == 14
         assert fake_application.calls == [
             ("initialize", {}),
             ("start_polling", {"drop_pending_updates": True}),
@@ -1108,6 +1108,37 @@ def test_clip_rejects_unknown_chats_without_creating_run_logs(tmp_path):
         session_factory = create_session_factory(settings.database_url)
         with session_factory() as session:
             assert session.scalars(select(RunLog)).all() == []
+
+    asyncio.run(run_test())
+
+
+def test_sources_command_displays_inline_controls_and_callbacks_mutate_queue(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+        with create_session_factory(settings.database_url)() as session:
+            add_source_videos(session, ["https://youtu.be/one"])
+
+        sources_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_sources(sources_update, FakeContext()) is True
+        assert "Source Video Queue" in sources_update.message.replies[0]
+        callback_data = [button.callback_data for row in sources_update.message.reply_markups[0].inline_keyboard for button in row]
+        assert "sources:add" in callback_data
+        assert "sources:list" in callback_data
+        assert "sources:remove:1" in callback_data
+
+        prompt = FakeCallbackQuery("sources:add")
+        assert await bot.handle_sources_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=prompt), FakeContext()) is True
+        assert "/sources add" in prompt.edits[0]
+
+        remove = FakeCallbackQuery("sources:remove:1")
+        assert await bot.handle_sources_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=remove), FakeContext()) is True
+        assert "cancelled" in remove.edits[0]
+
+        unauthorized = FakeCallbackQuery("sources:list")
+        assert await bot.handle_sources_callback(FakeUpdate(999, callback_query=unauthorized), FakeContext()) is False
+        assert unauthorized.answers == ["Unauthorized chat."]
 
     asyncio.run(run_test())
 
