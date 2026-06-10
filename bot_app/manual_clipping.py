@@ -46,6 +46,14 @@ class DirectVideoSource:
     file_size: int
 
 
+@dataclass
+class TelegramVideoUpload:
+    file_id: str
+    filename: str | None
+    content_type: str | None
+    file_size: int | None
+
+
 SUPPORTED_DIRECT_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 
 
@@ -406,6 +414,18 @@ class DirectVideoIngestor:
         if not address.is_global:
             raise ValueError("Direct video URL must point to a public host")
 
+    def validate_video_metadata(self, filename: str, content_type: str | None, file_size: int | None) -> str:
+        safe_filename = self._safe_filename(filename)
+        suffix = Path(safe_filename).suffix.lower()
+        normalized_content_type = content_type.split(";", 1)[0].strip().lower() if content_type else None
+        if suffix not in SUPPORTED_DIRECT_VIDEO_EXTENSIONS and not (
+            normalized_content_type and normalized_content_type.startswith("video/")
+        ):
+            raise ValueError("Upload must be a supported video file")
+        if file_size is not None and file_size > self.settings.source_video_max_bytes:
+            raise ValueError(f"Uploaded video is too large. Limit is {self.settings.source_video_max_bytes} bytes.")
+        return safe_filename
+
     def _header_value(self, headers, name: str) -> str | None:
         value = headers.get(name)
         if value is None:
@@ -568,8 +588,52 @@ class ManualClippingService:
         self.tiktok_publisher = tiktok_publisher
         self.direct_video_ingestor = direct_video_ingestor or DirectVideoIngestor(settings)
 
+    def prepare_telegram_file_run(self, session: Session, upload: TelegramVideoUpload) -> tuple[RunLog, Path]:
+        filename = self.direct_video_ingestor.validate_video_metadata(
+            upload.filename or f"telegram-{upload.file_id}.mp4",
+            upload.content_type,
+            upload.file_size,
+        )
+        run = RunLog(
+            source_url=f"telegram://{upload.file_id}",
+            source_type="telegram_file",
+            source_filename=filename,
+            source_content_type=upload.content_type,
+            source_file_size=upload.file_size,
+            status="finding_highlights",
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        target_path = self.settings.source_video_dir / str(run.id) / filename
+        run.source_path = str(target_path)
+        self.add_event(session, run, "started", "Manual Clipping started from Telegram upload")
+        session.commit()
+        session.refresh(run)
+        return run, target_path
+
+    def complete_telegram_file_run(self, session: Session, run_id: int) -> RunLog:
+        run = session.get(RunLog, run_id)
+        if run is None or run.source_type != "telegram_file" or not run.source_path:
+            raise ValueError("Telegram upload Run Log is not ready")
+        source_path = Path(run.source_path)
+        if not source_path.exists() or source_path.stat().st_size == 0:
+            raise ValueError("Telegram video download did not create a usable file")
+        if run.source_file_size is None:
+            run.source_file_size = source_path.stat().st_size
+        self.add_event(session, run, "source_downloaded", f"Downloaded Telegram upload to {run.source_filename}")
+        return self._find_and_store_highlights(session, run, source_path=source_path)
+
+    def fail_run(self, session: Session, run_id: int, error_message: str) -> None:
+        run = session.get(RunLog, run_id)
+        if run is None:
+            return
+        run.status = "failed"
+        run.error_message = error_message
+        self.add_event(session, run, "error", error_message)
+        session.commit()
+
     def start_run(self, session: Session, source_url: str) -> RunLog:
-        defaults = ensure_workflow_defaults(session)
         source_type = "direct_video_url" if self.direct_video_ingestor.is_direct_video_url(source_url) else "youtube"
         run = RunLog(source_url=source_url, source_type=source_type, status="finding_highlights")
         session.add(run)
@@ -587,43 +651,47 @@ class ManualClippingService:
                 run.source_file_size = direct_source.file_size
                 source_path = direct_source.path
                 self.add_event(session, run, "source_downloaded", f"Downloaded direct video URL to {direct_source.filename}")
-            if source_path is None:
-                drafts = self.highlight_finder.find_highlights(
-                    source_url,
-                    defaults.manual_highlight_candidates,
-                    defaults.subtitle_language,
-                )
-            else:
-                drafts = self.highlight_finder.find_highlights(
-                    source_url,
-                    defaults.manual_highlight_candidates,
-                    defaults.subtitle_language,
-                    source_path=source_path,
-                )
-            for index, draft in enumerate(drafts, start=1):
-                session.add(
-                    HighlightCandidate(
-                        run_id=run.id,
-                        candidate_number=index,
-                        title=draft.title,
-                        start_time=draft.start_time,
-                        end_time=draft.end_time,
-                        virality_score=draft.virality_score,
-                        hook_text=draft.hook_text,
-                        description=draft.description,
-                    )
-                )
-            run.status = "awaiting_selection"
-            self.add_event(session, run, "highlights_found", f"Found {len(drafts)} highlight candidates")
-            session.commit()
-            session.refresh(run)
-            return run
+            return self._find_and_store_highlights(session, run, source_path=source_path)
         except Exception as exc:
             run.status = "failed"
             run.error_message = str(exc)
             self.add_event(session, run, "error", str(exc))
             session.commit()
             raise
+
+    def _find_and_store_highlights(self, session: Session, run: RunLog, *, source_path: Path | None = None) -> RunLog:
+        defaults = ensure_workflow_defaults(session)
+        if source_path is None:
+            drafts = self.highlight_finder.find_highlights(
+                run.source_url,
+                defaults.manual_highlight_candidates,
+                defaults.subtitle_language,
+            )
+        else:
+            drafts = self.highlight_finder.find_highlights(
+                run.source_url,
+                defaults.manual_highlight_candidates,
+                defaults.subtitle_language,
+                source_path=source_path,
+            )
+        for index, draft in enumerate(drafts, start=1):
+            session.add(
+                HighlightCandidate(
+                    run_id=run.id,
+                    candidate_number=index,
+                    title=draft.title,
+                    start_time=draft.start_time,
+                    end_time=draft.end_time,
+                    virality_score=draft.virality_score,
+                    hook_text=draft.hook_text,
+                    description=draft.description,
+                )
+            )
+        run.status = "awaiting_selection"
+        self.add_event(session, run, "highlights_found", f"Found {len(drafts)} highlight candidates")
+        session.commit()
+        session.refresh(run)
+        return run
 
     def select_candidates(self, session: Session, run_id: int, numbers: list[int]) -> bool:
         run = session.get(RunLog, run_id)

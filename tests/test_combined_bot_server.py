@@ -33,8 +33,10 @@ def make_settings(tmp_path: Path) -> Settings:
 
 
 class FakeMessage:
-    def __init__(self):
+    def __init__(self, video=None, document=None):
         self.replies = []
+        self.video = video
+        self.document = document
 
     async def reply_text(self, text):
         self.replies.append(text)
@@ -46,14 +48,15 @@ class FakeChat:
 
 
 class FakeUpdate:
-    def __init__(self, chat_id):
+    def __init__(self, chat_id, message=None):
         self.effective_chat = FakeChat(chat_id)
-        self.message = FakeMessage()
+        self.message = message or FakeMessage()
 
 
 class FakeContext:
-    def __init__(self, args=None):
+    def __init__(self, args=None, bot=None):
         self.args = args or []
+        self.bot = bot
 
 
 class FakeTelegramBot:
@@ -126,7 +129,7 @@ def test_telegram_bot_start_polls_for_updates_and_stop_shuts_down(monkeypatch, t
         await bot.start()
 
         assert bot.started is True
-        assert len(fake_application.handlers) == 9
+        assert len(fake_application.handlers) == 10
         assert fake_application.calls == [
             ("initialize", {}),
             ("start_polling", {"drop_pending_updates": True}),
@@ -311,6 +314,37 @@ class FakeHttpResponse:
         return chunk
 
 
+class FakeTelegramUpload:
+    def __init__(self, file_id="file-1", file_name="upload.mp4", mime_type="video/mp4", file_size=14):
+        self.file_id = file_id
+        self.file_name = file_name
+        self.mime_type = mime_type
+        self.file_size = file_size
+
+
+class FakeTelegramFile:
+    def __init__(self, body=b"fake mp4 bytes"):
+        self.body = body
+        self.downloads = []
+
+    async def download_to_drive(self, custom_path):
+        path = Path(custom_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(self.body)
+        self.downloads.append(path)
+        return path
+
+
+class FakeTelegramDownloadBot:
+    def __init__(self, telegram_file=None):
+        self.telegram_file = telegram_file or FakeTelegramFile()
+        self.file_ids = []
+
+    async def get_file(self, file_id):
+        self.file_ids.append(file_id)
+        return self.telegram_file
+
+
 def test_gemini_highlight_finder_accepts_fenced_json_response():
     class FakeProvider:
         def generate_text(self, prompt):
@@ -408,6 +442,110 @@ def test_clip_start_failure_replies_and_records_failed_run(tmp_path):
             run = session.scalars(select(RunLog)).one()
             assert run.status == "failed"
             assert "Gemini did not return valid highlight JSON" in run.error_message
+
+    asyncio.run(run_test())
+
+
+def test_authorized_operator_can_start_telegram_video_manual_clipping(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        finder = FakeDirectVideoHighlightFinder()
+        service = ManualClippingService(settings, finder)
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+        download_bot = FakeTelegramDownloadBot()
+
+        message = FakeMessage(video=FakeTelegramUpload(file_id="video-file", file_name="telegram-video.mp4"))
+        update = FakeUpdate(settings.telegram_authorized_chat_id, message=message)
+        assert await bot.handle_video_upload(update, FakeContext(bot=download_bot)) is True
+        assert "Run Log 1 highlight candidates" in message.replies[0]
+        assert "Direct video moment" in message.replies[0]
+        assert download_bot.file_ids == ["video-file"]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            run = session.scalars(select(RunLog)).one()
+            assert run.source_type == "telegram_file"
+            assert run.source_filename == "telegram-video.mp4"
+            assert run.source_content_type == "video/mp4"
+            assert run.source_file_size == 14
+            assert run.source_path is not None
+            assert Path(run.source_path).exists()
+            assert Path(run.source_path).read_bytes() == b"fake mp4 bytes"
+
+        assert len(finder.calls) == 1
+        assert finder.calls[0][3] == Path(run.source_path)
+
+    asyncio.run(run_test())
+
+
+def test_authorized_operator_can_start_telegram_video_document_manual_clipping(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        service = ManualClippingService(settings, FakeDirectVideoHighlightFinder())
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+        document = FakeTelegramUpload(file_id="document-file", file_name="document-video.webm", mime_type="application/octet-stream")
+        message = FakeMessage(document=document)
+
+        assert await bot.handle_video_upload(
+            FakeUpdate(settings.telegram_authorized_chat_id, message=message),
+            FakeContext(bot=FakeTelegramDownloadBot()),
+        ) is True
+        assert "Run Log 1 highlight candidates" in message.replies[0]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            run = session.scalars(select(RunLog)).one()
+            assert run.source_type == "telegram_file"
+            assert run.source_filename == "document-video.webm"
+            assert Path(run.source_path).exists()
+
+    asyncio.run(run_test())
+
+
+def test_telegram_video_upload_rejects_unsupported_and_oversized_files(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        settings.source_video_max_bytes = 10
+        initialize_database(settings.database_url)
+        service = ManualClippingService(settings, FakeDirectVideoHighlightFinder())
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        unsupported_message = FakeMessage(document=FakeTelegramUpload(file_name="notes.txt", mime_type="text/plain", file_size=5))
+        assert await bot.handle_video_upload(
+            FakeUpdate(settings.telegram_authorized_chat_id, message=unsupported_message),
+            FakeContext(bot=FakeTelegramDownloadBot()),
+        ) is False
+        assert "supported video file" in unsupported_message.replies[0]
+
+        oversized_message = FakeMessage(video=FakeTelegramUpload(file_name="large.mp4", file_size=11))
+        assert await bot.handle_video_upload(
+            FakeUpdate(settings.telegram_authorized_chat_id, message=oversized_message),
+            FakeContext(bot=FakeTelegramDownloadBot()),
+        ) is False
+        assert "too large" in oversized_message.replies[0]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            assert session.scalars(select(RunLog)).all() == []
+
+    asyncio.run(run_test())
+
+
+def test_telegram_video_upload_rejects_unknown_chats_without_creating_run_logs(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+        message = FakeMessage(video=FakeTelegramUpload())
+
+        assert await bot.handle_video_upload(FakeUpdate(999, message=message), FakeContext(bot=FakeTelegramDownloadBot())) is False
+        assert message.replies == ["Unauthorized chat."]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            assert session.scalars(select(RunLog)).all() == []
 
     asyncio.run(run_test())
 

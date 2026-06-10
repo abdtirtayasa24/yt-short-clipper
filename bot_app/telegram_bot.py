@@ -2,10 +2,10 @@ from typing import Protocol
 
 from sqlalchemy import func, select
 from telegram import Update
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 from bot_app.database import create_session_factory, ensure_workflow_defaults, initialize_database
-from bot_app.manual_clipping import ManualClippingService
+from bot_app.manual_clipping import ManualClippingService, TelegramVideoUpload
 from bot_app.models import RunLog, SourceVideo
 from bot_app.scheduler import add_daily_schedule, add_weekly_schedule, list_schedules, remove_schedule
 from bot_app.settings import Settings
@@ -49,6 +49,7 @@ class AuthorizedOperatorTelegramBot:
         self.application.add_handler(CommandHandler("schedule", self.handle_schedule))
         self.application.add_handler(CommandHandler("auth", self.handle_auth))
         self.application.add_handler(CommandHandler("cancel", self.handle_cancel))
+        self.application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, self.handle_video_upload))
         await self.application.initialize()
         if self.application.updater is None:
             raise RuntimeError("Telegram bot requires an updater for polling")
@@ -191,6 +192,57 @@ class AuthorizedOperatorTelegramBot:
             "Usage: /schedule add daily <HH:MM>, "
             "/schedule add weekly <weekday> <HH:MM>, /schedule list, or /schedule remove <schedule_id>"
         )
+
+    async def handle_video_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        if await self._reject_unknown_chat(update):
+            return False
+
+        message = getattr(update, "message", None)
+        upload = self._extract_video_upload(message)
+        if upload is None:
+            if message is not None:
+                await message.reply_text("Please upload a supported video file.")
+            return False
+
+        run_id = None
+        try:
+            with self.session_factory() as session:
+                run, target_path = self.manual_clipping_service.prepare_telegram_file_run(session, upload)
+                run_id = run.id
+            telegram_file = await context.bot.get_file(upload.file_id)
+            await telegram_file.download_to_drive(custom_path=target_path)
+            with self.session_factory() as session:
+                run = self.manual_clipping_service.complete_telegram_file_run(session, run_id)
+                response = self._format_highlight_review(run)
+            await message.reply_text(response)
+            return True
+        except Exception as exc:
+            if run_id is not None:
+                with self.session_factory() as session:
+                    self.manual_clipping_service.fail_run(session, run_id, str(exc))
+            await message.reply_text(f"Manual Clipping failed: {exc}")
+            return False
+
+    def _extract_video_upload(self, message) -> TelegramVideoUpload | None:
+        if message is None:
+            return None
+        video = getattr(message, "video", None)
+        if video is not None:
+            return TelegramVideoUpload(
+                file_id=video.file_id,
+                filename=getattr(video, "file_name", None) or f"{video.file_id}.mp4",
+                content_type=getattr(video, "mime_type", None) or "video/mp4",
+                file_size=getattr(video, "file_size", None),
+            )
+        document = getattr(message, "document", None)
+        if document is not None:
+            return TelegramVideoUpload(
+                file_id=document.file_id,
+                filename=getattr(document, "file_name", None),
+                content_type=getattr(document, "mime_type", None),
+                file_size=getattr(document, "file_size", None),
+            )
+        return None
 
     async def handle_clip(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
