@@ -3,6 +3,7 @@ from pathlib import Path
 from secrets import token_urlsafe
 from urllib.parse import urljoin
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from bot_app.models import ClipRecord
@@ -50,6 +51,36 @@ def _as_aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def cleanup_expired_clips(
+    session: Session,
+    settings: Settings,
+    now: datetime | None = None,
+) -> int:
+    current_time = _as_aware_utc(now or datetime.now(timezone.utc))
+    archive_root = settings.clip_archive_dir.resolve()
+    expired_records = session.scalars(
+        select(ClipRecord).where(
+            ClipRecord.deleted_at.is_(None),
+            ClipRecord.expires_at.is_not(None),
+            ClipRecord.expires_at <= current_time,
+        )
+    ).all()
+
+    deleted_count = 0
+    for record in expired_records:
+        clip_path = Path(record.archive_path).resolve()
+        try:
+            clip_path.relative_to(archive_root)
+        except ValueError:
+            continue
+        if clip_path.exists():
+            clip_path.unlink()
+        record.deleted_at = current_time
+        deleted_count += 1
+    session.commit()
+    return deleted_count
 
 
 def resolve_downloadable_clip_path(

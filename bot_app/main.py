@@ -1,10 +1,11 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 
-from bot_app.clip_archive import resolve_downloadable_clip_path
+from bot_app.clip_archive import cleanup_expired_clips, resolve_downloadable_clip_path
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.models import ClipRecord
 from bot_app.settings import Settings
@@ -20,6 +21,12 @@ def create_app(settings: Settings | None = None, telegram_bot: TelegramBotShell 
         app.state.settings = app_settings
         app.state.session_factory = create_session_factory(app_settings.database_url)
         initialize_database(app_settings.database_url)
+
+        def run_cleanup() -> None:
+            with app.state.session_factory() as session:
+                cleanup_expired_clips(session, app_settings)
+
+        await asyncio.to_thread(run_cleanup)
         await bot.start()
         try:
             yield

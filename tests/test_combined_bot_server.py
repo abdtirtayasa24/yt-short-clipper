@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from bot_app.ai_providers import GeminiTextProvider, OpenRouterAudioAdapter
-from bot_app.clip_archive import create_clip_record
+from bot_app.clip_archive import cleanup_expired_clips, create_clip_record
 from bot_app.manual_clipping import HighlightDraft, ManualClippingService, PublishingMetadata
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
@@ -674,6 +674,69 @@ def test_combined_bot_server_creates_sqlite_parent_directory(tmp_path):
     initialize_database(nested_database_url)
 
     assert (tmp_path / "nested" / "data" / "bot.db").exists()
+
+
+def test_clip_archive_cleanup_removes_expired_files_and_preserves_run_logs(tmp_path):
+    settings = make_settings(tmp_path)
+    initialize_database(settings.database_url)
+    expired_file = settings.clip_archive_dir / "expired.mp4"
+    active_file = settings.clip_archive_dir / "active.mp4"
+    outside_file = tmp_path / "outside.mp4"
+    expired_file.parent.mkdir(parents=True, exist_ok=True)
+    expired_file.write_bytes(b"expired")
+    active_file.write_bytes(b"active")
+    outside_file.write_bytes(b"outside")
+
+    session_factory = create_session_factory(settings.database_url)
+    with session_factory() as session:
+        session.add(RunLog(source_url="https://youtu.be/history", status="processed"))
+        expired = create_clip_record(
+            session,
+            settings,
+            expired_file,
+            expires_at=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+        active = create_clip_record(session, settings, active_file)
+        unsafe = create_clip_record(
+            session,
+            settings,
+            outside_file,
+            expires_at=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+
+        deleted_count = cleanup_expired_clips(session, settings)
+
+        assert deleted_count == 1
+        assert not expired_file.exists()
+        assert active_file.exists()
+        assert outside_file.exists()
+        assert session.get(ClipRecord, expired.id).deleted_at is not None
+        assert session.get(ClipRecord, active.id).deleted_at is None
+        assert session.get(ClipRecord, unsafe.id).deleted_at is None
+        assert session.scalars(select(RunLog)).one().source_url == "https://youtu.be/history"
+
+
+def test_combined_bot_server_runs_clip_archive_cleanup_on_startup(tmp_path):
+    settings = make_settings(tmp_path)
+    initialize_database(settings.database_url)
+    expired_file = settings.clip_archive_dir / "expired.mp4"
+    expired_file.parent.mkdir(parents=True, exist_ok=True)
+    expired_file.write_bytes(b"expired")
+
+    session_factory = create_session_factory(settings.database_url)
+    with session_factory() as session:
+        create_clip_record(
+            session,
+            settings,
+            expired_file,
+            expires_at=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+
+    app = create_app(settings, telegram_bot=FakeTelegramBot())
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+
+    assert not expired_file.exists()
 
 
 def test_public_clip_link_downloads_recorded_archive_file(tmp_path):
