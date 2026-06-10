@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
+from openai import OpenAI
+
 from sqlalchemy.orm import Session
 
 from bot_app.ai_providers import GeminiTextProvider
@@ -31,7 +33,12 @@ class HighlightDraft:
 
 
 class HighlightFinder(Protocol):
-    def find_highlights(self, youtube_url: str, count: int) -> list[HighlightDraft]:
+    def find_highlights(
+        self,
+        youtube_url: str,
+        count: int,
+        subtitle_language: str = "en",
+    ) -> list[HighlightDraft]:
         ...
 
 
@@ -48,6 +55,54 @@ class MetadataGenerator(Protocol):
         model: str,
     ) -> PublishingMetadata:
         ...
+
+
+def _normalize_timestamp(value: str) -> str:
+    text = str(value).strip().replace(".", ",")
+    if ":" not in text:
+        return "00:00:00,000"
+    parts = text.split(":")
+    if len(parts) == 2:
+        minutes, seconds = parts
+        parts = ["00", minutes, seconds]
+    if len(parts) != 3:
+        return text
+    hours, minutes, seconds = parts
+    if "," not in seconds:
+        seconds = f"{seconds},000"
+    whole_seconds, milliseconds = seconds.split(",", 1)
+    return f"{int(hours):02d}:{int(minutes):02d}:{int(whole_seconds):02d},{milliseconds[:3].ljust(3, '0')}"
+
+
+def _timestamp_seconds(value: str) -> float:
+    normalized = _normalize_timestamp(value).replace(",", ".")
+    hours, minutes, seconds = normalized.split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def _highlight_draft_from_mapping(item: dict) -> HighlightDraft:
+    return HighlightDraft(
+        title=str(item.get("title", "Untitled highlight")),
+        start_time=_normalize_timestamp(item.get("start_time", "00:00:00,000")),
+        end_time=_normalize_timestamp(item.get("end_time", "00:00:30,000")),
+        virality_score=int(round(float(item.get("virality_score", 0)))),
+        hook_text=str(item.get("hook_text", item.get("title", "Watch this"))),
+        description=str(item.get("description", "")),
+    )
+
+
+def _candidate_to_core_highlight(candidate: HighlightCandidate) -> dict:
+    start_time = _normalize_timestamp(candidate.start_time)
+    end_time = _normalize_timestamp(candidate.end_time)
+    return {
+        "title": candidate.title,
+        "start_time": start_time,
+        "end_time": end_time,
+        "virality_score": candidate.virality_score,
+        "hook_text": candidate.hook_text,
+        "description": candidate.description,
+        "duration_seconds": max(0.0, _timestamp_seconds(end_time) - _timestamp_seconds(start_time)),
+    }
 
 
 def _parse_gemini_json(raw_response: str, expected_root: str):
@@ -113,6 +168,9 @@ class ClipProcessor(Protocol):
 
 
 class ExistingClipProcessor:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
     def process_highlight(
         self,
         source_url: str,
@@ -121,7 +179,62 @@ class ExistingClipProcessor:
         captions_enabled: bool,
         hooks_enabled: bool,
     ) -> Path:
-        raise NotImplementedError("Existing clipping behavior is not wired for Bot Control Mode yet")
+        from clipper_core import AutoClipperCore
+
+        output_dir = self.settings.clip_archive_dir / "processed"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        client = OpenAI(
+            api_key=self.settings.openrouter_api_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+        core = AutoClipperCore(
+            client=client,
+            output_dir=str(output_dir),
+            ai_providers={
+                "highlight_finder": {
+                    "api_key": self.settings.openrouter_api_key,
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": self.settings.openrouter_transcription_model,
+                },
+                "caption_maker": {
+                    "api_key": self.settings.openrouter_api_key,
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": self.settings.openrouter_transcription_model,
+                },
+                "hook_maker": {
+                    "api_key": self.settings.openrouter_api_key,
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": self.settings.openrouter_tts_model,
+                },
+            },
+            subtitle_language="en",
+        )
+        highlight = _candidate_to_core_highlight(candidate)
+        section_path = output_dir / "_temp" / f"run_{candidate.run_id}_candidate_{candidate.candidate_number}.mp4"
+        section_path.parent.mkdir(parents=True, exist_ok=True)
+        video_path = core.download_video_section(
+            source_url,
+            highlight["start_time"],
+            highlight["end_time"],
+            str(section_path),
+        )
+        before = set(output_dir.glob("*/master.mp4"))
+        core.process_clip(
+            video_path,
+            highlight,
+            candidate.candidate_number,
+            1,
+            add_captions=captions_enabled,
+            add_hook=hooks_enabled,
+            pre_cut=True,
+        )
+        after = set(output_dir.glob("*/master.mp4"))
+        created = sorted(after - before, key=lambda path: path.stat().st_mtime, reverse=True)
+        if not created:
+            created = sorted(output_dir.glob("*/master.mp4"), key=lambda path: path.stat().st_mtime, reverse=True)
+        if not created:
+            raise RuntimeError("Clip processing finished without creating master.mp4")
+        return created[0]
 
 
 class ClippingQueue:
@@ -141,16 +254,71 @@ class ClippingQueue:
 
 class GeminiHighlightFinder:
     def __init__(self, settings: Settings):
+        self.settings = settings
         self.provider = GeminiTextProvider(settings)
 
-    def find_highlights(self, youtube_url: str, count: int) -> list[HighlightDraft]:
+    def find_highlights(
+        self,
+        youtube_url: str,
+        count: int,
+        subtitle_language: str = "en",
+    ) -> list[HighlightDraft]:
+        transcript, video_info = self._load_transcript(youtube_url, subtitle_language)
         prompt = (
-            f"Find {count} short-form highlight candidates for this YouTube URL: {youtube_url}. "
-            "Return JSON array with title, start_time, end_time, virality_score, hook_text, description."
+            f"Find {count} short-form highlight candidates from the transcript below. "
+            "Use only the transcript and metadata provided; do not invent topics that are not present. "
+            "Return JSON only as an array of objects with title, start_time, end_time, virality_score, "
+            "hook_text, and description. Times must come from the transcript and use HH:MM:SS,mmm.\n\n"
+            f"Video title: {video_info.get('title', '')}\n"
+            f"Channel: {video_info.get('channel', '')}\n"
+            f"URL: {youtube_url}\n\n"
+            f"Transcript:\n{transcript}"
         )
         raw_response = self.provider.generate_text(prompt)
         data = _parse_gemini_json(raw_response, "array")
-        return [HighlightDraft(**item) for item in data[:count]]
+        return [_highlight_draft_from_mapping(item) for item in data[:count]]
+
+    def _load_transcript(self, youtube_url: str, subtitle_language: str) -> tuple[str, dict]:
+        from clipper_core import AutoClipperCore
+
+        work_dir = Path("data/manual_clipping")
+        work_dir.mkdir(parents=True, exist_ok=True)
+        core = AutoClipperCore(
+            client=OpenAI(api_key=self.settings.openrouter_api_key, base_url="https://openrouter.ai/api/v1"),
+            output_dir=str(work_dir),
+            ytdlp_path="yt_dlp_module",
+            subtitle_language=subtitle_language,
+            ai_providers={
+                "highlight_finder": {
+                    "api_key": self.settings.openrouter_api_key,
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": self.settings.openrouter_transcription_model,
+                },
+                "caption_maker": {
+                    "api_key": self.settings.openrouter_api_key,
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": self.settings.openrouter_transcription_model,
+                },
+                "hook_maker": {
+                    "api_key": self.settings.openrouter_api_key,
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": self.settings.openrouter_tts_model,
+                },
+            },
+        )
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        core.temp_dir = work_dir / timestamp / "_temp"
+        core.temp_dir.mkdir(parents=True, exist_ok=True)
+        srt_path, video_info = core.download_subtitle_only(youtube_url)
+        if not srt_path:
+            core.subtitle_language = "none"
+            video_path, _srt_path, fallback_video_info = core.download_video(youtube_url)
+            transcript = core.transcribe_full_video(video_path)
+            return transcript, fallback_video_info or video_info or {}
+        transcript = core.parse_srt(srt_path)
+        if not transcript.strip():
+            raise ValueError("Subtitle transcript is empty")
+        return transcript, video_info or {}
 
 
 class ManualClippingService:
@@ -166,7 +334,7 @@ class ManualClippingService:
     ):
         self.settings = settings
         self.highlight_finder = highlight_finder or GeminiHighlightFinder(settings)
-        self.clip_processor = clip_processor or ExistingClipProcessor()
+        self.clip_processor = clip_processor or ExistingClipProcessor(settings)
         self.clipping_queue = clipping_queue or ClippingQueue()
         self.metadata_generator = metadata_generator or GeminiMetadataGenerator(settings)
         self.youtube_publisher = youtube_publisher
@@ -181,7 +349,11 @@ class ManualClippingService:
         self.add_event(session, run, "started", "Manual Clipping started")
 
         try:
-            drafts = self.highlight_finder.find_highlights(youtube_url, defaults.manual_highlight_candidates)
+            drafts = self.highlight_finder.find_highlights(
+                youtube_url,
+                defaults.manual_highlight_candidates,
+                defaults.subtitle_language,
+            )
             for index, draft in enumerate(drafts, start=1):
                 session.add(
                     HighlightCandidate(

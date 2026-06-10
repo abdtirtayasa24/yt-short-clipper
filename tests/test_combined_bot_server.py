@@ -243,7 +243,7 @@ def test_authorized_operator_commands_work_and_unknown_chats_are_rejected(tmp_pa
 
 
 class FailingHighlightFinder:
-    def find_highlights(self, youtube_url, count):
+    def find_highlights(self, youtube_url, count, subtitle_language="en"):
         raise ValueError("Gemini did not return valid highlight JSON")
 
 
@@ -251,8 +251,8 @@ class FakeHighlightFinder:
     def __init__(self):
         self.calls = []
 
-    def find_highlights(self, youtube_url, count):
-        self.calls.append((youtube_url, count))
+    def find_highlights(self, youtube_url, count, subtitle_language="en"):
+        self.calls.append((youtube_url, count, subtitle_language))
         return [
             HighlightDraft(
                 title="Great moment",
@@ -284,6 +284,10 @@ def test_gemini_highlight_finder_accepts_fenced_json_response():
 
     finder = GeminiHighlightFinder.__new__(GeminiHighlightFinder)
     finder.provider = FakeProvider()
+    finder._load_transcript = lambda youtube_url, subtitle_language: (
+        "00:00:01,000 --> 00:01:01,000 A real transcript line from the video",
+        {"title": "Real video", "channel": "Real channel"},
+    )
 
     highlights = finder.find_highlights("https://youtu.be/manual", 1)
 
@@ -337,7 +341,7 @@ def test_authorized_operator_can_start_select_and_cancel_manual_clipping(tmp_pat
         assert "Virality: 9" in reply
         assert "Hook: Watch this" in reply
         assert "Description: A strong highlight" in reply
-        assert finder.calls == [("https://youtu.be/manual", 5)]
+        assert finder.calls == [("https://youtu.be/manual", 5, "en")]
 
         select_update = FakeUpdate(settings.telegram_authorized_chat_id)
         assert await bot.handle_clip(select_update, FakeContext(["select", "1", "1", "3"])) is True
