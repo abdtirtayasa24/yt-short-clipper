@@ -316,6 +316,14 @@ class FailingHighlightFinder:
         raise ValueError("Gemini did not return valid highlight JSON")
 
 
+class FailingHighlightFinderWithMessage:
+    def __init__(self, message):
+        self.message = message
+
+    def find_highlights(self, youtube_url, count, subtitle_language="en"):
+        raise ValueError(self.message)
+
+
 class FakeHighlightFinder:
     def __init__(self):
         self.calls = []
@@ -486,6 +494,39 @@ def test_gemini_highlight_finder_uses_local_transcript_for_direct_video(tmp_path
     ]
     assert "A local transcript line" in finder.provider.prompts[0]
     assert "https://media.example.com/source.mp4" in finder.provider.prompts[0]
+
+
+def test_youtube_failures_return_actionable_operator_guidance_and_keep_raw_events(tmp_path):
+    async def assert_guidance(raw_error, expected_text):
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        service = ManualClippingService(settings, FailingHighlightFinderWithMessage(raw_error))
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(update, FakeContext(["https://youtu.be/manual"])) is False
+        reply = update.message.replies[0]
+        assert expected_text in reply
+        assert "direct video URL" in reply
+        assert "uploading the video to Telegram" in reply
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            run = session.scalars(select(RunLog)).one()
+            assert run.status == "failed"
+            assert run.error_message == raw_error
+            event = session.scalars(select(RunEvent).where(RunEvent.event_type == "error")).one()
+            assert event.message == raw_error
+
+    awaitable_errors = [
+        ("ERROR: You have requested downloading the video partially, but ffmpeg is not installed. Aborting", "FFmpeg is required"),
+        ("ERROR: [youtube] abc: Requested format is not available. Use --list-formats", "YouTube challenge solving"),
+        ("ERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies", "fresh YouTube cookies"),
+    ]
+
+    for raw_error, expected_text in awaitable_errors:
+        asyncio.run(assert_guidance(raw_error, expected_text))
+        tmp_path.joinpath("bot.db").unlink(missing_ok=True)
 
 
 def test_clip_start_failure_replies_and_records_failed_run(tmp_path):

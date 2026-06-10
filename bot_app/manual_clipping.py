@@ -57,6 +57,10 @@ class TelegramVideoUpload:
 SUPPORTED_DIRECT_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 
 
+class ManualClippingUserError(Exception):
+    """Operator-facing Manual Clipping error with low-level details already recorded."""
+
+
 class HighlightFinder(Protocol):
     def find_highlights(
         self,
@@ -130,6 +134,39 @@ def _candidate_to_core_highlight(candidate: HighlightCandidate) -> dict:
         "description": candidate.description,
         "duration_seconds": max(0.0, _timestamp_seconds(end_time) - _timestamp_seconds(start_time)),
     }
+
+
+def _youtube_fallback_guidance() -> str:
+    return "You can also retry with a direct video URL or by uploading the video to Telegram."
+
+
+def _operator_error_message(error_message: str) -> str:
+    text = error_message or ""
+    lowered = text.lower()
+    if "ffmpeg is not installed" in lowered or "ffmpeg" in lowered and "partial" in lowered:
+        return (
+            "FFmpeg is required for partial YouTube downloads on this server. "
+            "Install/configure FFmpeg for the service runtime, then retry. "
+            f"{_youtube_fallback_guidance()}"
+        )
+    if "sign in to confirm" in lowered or "not a bot" in lowered or "cookies" in lowered or "cookie" in lowered:
+        return (
+            "YouTube is requiring fresh YouTube cookies or bot verification for this VPS. "
+            "Export fresh cookies from a logged-in browser session and update cookies.txt. "
+            f"{_youtube_fallback_guidance()}"
+        )
+    if "requested format is not available" in lowered or "n challenge" in lowered or "challenge solving failed" in lowered:
+        return (
+            "YouTube challenge solving may be unavailable or incomplete, so yt-dlp cannot see downloadable video formats. "
+            "Ensure Deno/challenge solver support is available to the service runtime. "
+            f"{_youtube_fallback_guidance()}"
+        )
+    if "[youtube]" in lowered or "yt-dlp" in lowered or "youtube" in lowered:
+        return (
+            "YouTube access failed while yt-dlp was preparing this Manual Clipping run. "
+            f"{_youtube_fallback_guidance()}"
+        )
+    return text
 
 
 def _parse_gemini_json(raw_response: str, expected_root: str):
@@ -653,10 +690,14 @@ class ManualClippingService:
                 self.add_event(session, run, "source_downloaded", f"Downloaded direct video URL to {direct_source.filename}")
             return self._find_and_store_highlights(session, run, source_path=source_path)
         except Exception as exc:
+            raw_error = str(exc)
             run.status = "failed"
-            run.error_message = str(exc)
-            self.add_event(session, run, "error", str(exc))
+            run.error_message = raw_error
+            self.add_event(session, run, "error", raw_error)
             session.commit()
+            operator_message = _operator_error_message(raw_error)
+            if operator_message != raw_error:
+                raise ManualClippingUserError(operator_message) from exc
             raise
 
     def _find_and_store_highlights(self, session: Session, run: RunLog, *, source_path: Path | None = None) -> RunLog:
@@ -796,10 +837,14 @@ class ManualClippingService:
             session.commit()
             return links
         except Exception as exc:
+            raw_error = str(exc)
             run.status = "failed"
-            run.error_message = str(exc)
-            self.add_event(session, run, "error", str(exc))
+            run.error_message = raw_error
+            self.add_event(session, run, "error", raw_error)
             session.commit()
+            operator_message = _operator_error_message(raw_error)
+            if operator_message != raw_error:
+                raise ManualClippingUserError(operator_message) from exc
             raise
         finally:
             self.clipping_queue.finish(run_id)
