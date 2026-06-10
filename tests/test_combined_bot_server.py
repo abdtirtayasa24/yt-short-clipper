@@ -35,11 +35,13 @@ def make_settings(tmp_path: Path) -> Settings:
 class FakeMessage:
     def __init__(self, video=None, document=None):
         self.replies = []
+        self.reply_markups = []
         self.video = video
         self.document = document
 
-    async def reply_text(self, text):
+    async def reply_text(self, text, reply_markup=None):
         self.replies.append(text)
+        self.reply_markups.append(reply_markup)
 
 
 class FakeChat:
@@ -47,10 +49,26 @@ class FakeChat:
         self.id = chat_id
 
 
+class FakeCallbackQuery:
+    def __init__(self, data):
+        self.data = data
+        self.answers = []
+        self.edits = []
+        self.edit_markups = []
+
+    async def answer(self, text=None):
+        self.answers.append(text)
+
+    async def edit_message_text(self, text, reply_markup=None):
+        self.edits.append(text)
+        self.edit_markups.append(reply_markup)
+
+
 class FakeUpdate:
-    def __init__(self, chat_id, message=None):
+    def __init__(self, chat_id, message=None, callback_query=None):
         self.effective_chat = FakeChat(chat_id)
-        self.message = message or FakeMessage()
+        self.message = message if message is not None else (None if callback_query is not None else FakeMessage())
+        self.callback_query = callback_query
 
 
 class FakeContext:
@@ -129,7 +147,7 @@ def test_telegram_bot_start_polls_for_updates_and_stop_shuts_down(monkeypatch, t
         await bot.start()
 
         assert bot.started is True
-        assert len(fake_application.handlers) == 10
+        assert len(fake_application.handlers) == 11
         assert fake_application.calls == [
             ("initialize", {}),
             ("start_polling", {"drop_pending_updates": True}),
@@ -761,6 +779,76 @@ class FakeDirectClipProcessor:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(f"direct-clip-{candidate.candidate_number}".encode())
         return output_path
+
+
+def test_highlight_review_includes_inline_selection_buttons(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        service = ManualClippingService(settings, FakeHighlightFinder())
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(update, FakeContext(["https://youtu.be/manual"])) is True
+        markup = update.message.reply_markups[0]
+        assert markup is not None
+        callback_data = [button.callback_data for row in markup.inline_keyboard for button in row]
+        assert "clip:toggle:1:1" in callback_data
+        assert "clip:process:1" in callback_data
+        assert "clip:cancel:1" in callback_data
+
+    asyncio.run(run_test())
+
+
+def test_inline_highlight_buttons_toggle_process_cancel_and_reject_unauthorized(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        processor = FakeClipProcessor(settings.clip_archive_dir)
+        service = ManualClippingService(
+            settings,
+            FakeHighlightFinder(),
+            clip_processor=processor,
+            metadata_generator=FakeMetadataGenerator(),
+        )
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        assert await bot.handle_clip(FakeUpdate(settings.telegram_authorized_chat_id), FakeContext(["https://youtu.be/manual"])) is True
+
+        toggle = FakeCallbackQuery("clip:toggle:1:1")
+        assert await bot.handle_clip_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=toggle), FakeContext()) is True
+        assert toggle.answers == ["Selected highlight 1."]
+        assert "✅ 1" in [button.text for row in toggle.edit_markups[0].inline_keyboard for button in row]
+
+        with create_session_factory(settings.database_url)() as session:
+            candidate = session.scalars(select(HighlightCandidate).where(HighlightCandidate.candidate_number == 1)).first()
+            assert candidate.selected is True
+            assert session.get(RunLog, 1).status == "selection_ready"
+
+        untoggle = FakeCallbackQuery("clip:toggle:1:1")
+        assert await bot.handle_clip_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=untoggle), FakeContext()) is True
+        assert untoggle.answers == ["Unselected highlight 1."]
+        with create_session_factory(settings.database_url)() as session:
+            candidate = session.scalars(select(HighlightCandidate).where(HighlightCandidate.candidate_number == 1)).first()
+            assert candidate.selected is False
+            assert session.get(RunLog, 1).status == "awaiting_selection"
+
+        assert await bot.handle_clip_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=FakeCallbackQuery("clip:toggle:1:2")), FakeContext()) is True
+        process = FakeCallbackQuery("clip:process:1")
+        assert await bot.handle_clip_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=process), FakeContext()) is True
+        assert "Public Clip Links" in process.edits[0]
+        assert processor.calls == [("https://youtu.be/manual", 2, True, True)]
+
+        assert await bot.handle_clip(FakeUpdate(settings.telegram_authorized_chat_id), FakeContext(["https://youtu.be/cancel"])) is True
+        cancel = FakeCallbackQuery("clip:cancel:2")
+        assert await bot.handle_clip_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=cancel), FakeContext()) is True
+        assert "Cancelled Run Log 2" in cancel.edits[0]
+
+        unauthorized = FakeCallbackQuery("clip:toggle:1:1")
+        assert await bot.handle_clip_callback(FakeUpdate(999, callback_query=unauthorized), FakeContext()) is False
+        assert unauthorized.answers == ["Unauthorized chat."]
+
+    asyncio.run(run_test())
 
 
 def test_auth_command_reports_preauthorization_status(tmp_path):

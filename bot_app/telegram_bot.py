@@ -1,8 +1,8 @@
 from typing import Protocol
 
 from sqlalchemy import func, select
-from telegram import Update
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from bot_app.database import create_session_factory, ensure_workflow_defaults, initialize_database
 from bot_app.manual_clipping import ManualClippingService, TelegramVideoUpload
@@ -49,6 +49,7 @@ class AuthorizedOperatorTelegramBot:
         self.application.add_handler(CommandHandler("schedule", self.handle_schedule))
         self.application.add_handler(CommandHandler("auth", self.handle_auth))
         self.application.add_handler(CommandHandler("cancel", self.handle_cancel))
+        self.application.add_handler(CallbackQueryHandler(self.handle_clip_callback, pattern=r"^clip:"))
         self.application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, self.handle_video_upload))
         await self.application.initialize()
         if self.application.updater is None:
@@ -193,6 +194,68 @@ class AuthorizedOperatorTelegramBot:
             "/schedule add weekly <weekday> <HH:MM>, /schedule list, or /schedule remove <schedule_id>"
         )
 
+    async def handle_clip_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        query = getattr(update, "callback_query", None)
+        if query is None:
+            return False
+        if await self._reject_unknown_chat(update):
+            await query.answer("Unauthorized chat.")
+            return False
+
+        data = str(getattr(query, "data", ""))
+        parts = data.split(":")
+        if len(parts) < 3 or parts[0] != "clip":
+            await query.answer("Unknown action.")
+            return False
+        action = parts[1]
+        if not parts[2].isdigit():
+            await query.answer("Unknown run.")
+            return False
+        run_id = int(parts[2])
+
+        if action == "toggle" and len(parts) == 4 and parts[3].isdigit():
+            candidate_number = int(parts[3])
+            with self.session_factory() as session:
+                selected = self.manual_clipping_service.toggle_candidate_selection(session, run_id, candidate_number)
+                run = session.get(RunLog, run_id)
+                if selected is None or run is None:
+                    await query.answer("Unable to update selection.")
+                    return False
+                response = self._format_highlight_review(run)
+                reply_markup = self._highlight_review_markup(run)
+            await query.answer(f"{'Selected' if selected else 'Unselected'} highlight {candidate_number}.")
+            await query.edit_message_text(response, reply_markup=reply_markup)
+            return True
+
+        if action == "process" and len(parts) == 3:
+            try:
+                with self.session_factory() as session:
+                    links = self.manual_clipping_service.process_selected_run(session, self.settings, run_id)
+                await query.answer("Processing selected highlights.")
+                if links:
+                    await query.edit_message_text("Public Clip Links:\n" + "\n".join(links))
+                    return True
+                await query.edit_message_text("Run is queued or cannot be processed yet.")
+                return False
+            except Exception as exc:
+                await query.answer("Processing failed.")
+                await query.edit_message_text(f"Manual Clipping processing failed: {exc}")
+                return False
+
+        if action == "cancel" and len(parts) == 3:
+            with self.session_factory() as session:
+                cancelled = self.manual_clipping_service.cancel_run(session, run_id)
+            if cancelled:
+                await query.answer("Run cancelled.")
+                await query.edit_message_text(f"Cancelled Run Log {run_id}.")
+                return True
+            await query.answer("Unable to cancel run.")
+            await query.edit_message_text("Run cannot be cancelled.")
+            return False
+
+        await query.answer("Unknown action.")
+        return False
+
     async def handle_video_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
             return False
@@ -214,7 +277,8 @@ class AuthorizedOperatorTelegramBot:
             with self.session_factory() as session:
                 run = self.manual_clipping_service.complete_telegram_file_run(session, run_id)
                 response = self._format_highlight_review(run)
-            await message.reply_text(response)
+                reply_markup = self._highlight_review_markup(run)
+            await message.reply_text(response, reply_markup=reply_markup)
             return True
         except Exception as exc:
             if run_id is not None:
@@ -299,7 +363,8 @@ class AuthorizedOperatorTelegramBot:
                 with self.session_factory() as session:
                     run = self.manual_clipping_service.start_run(session, args[0])
                     response = self._format_highlight_review(run)
-                await update.message.reply_text(response)
+                    reply_markup = self._highlight_review_markup(run)
+                await update.message.reply_text(response, reply_markup=reply_markup)
                 return True
             except Exception as exc:
                 await update.message.reply_text(f"Manual Clipping failed: {exc}")
@@ -307,6 +372,26 @@ class AuthorizedOperatorTelegramBot:
 
         await update.message.reply_text(self._clip_usage())
         return False
+
+    def _highlight_review_markup(self, run) -> InlineKeyboardMarkup:
+        rows = []
+        for candidate in sorted(run.highlight_candidates, key=lambda item: item.candidate_number):
+            state = "✅" if candidate.selected else "☐"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{state} {candidate.candidate_number}",
+                        callback_data=f"clip:toggle:{run.id}:{candidate.candidate_number}",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton("Process Selected", callback_data=f"clip:process:{run.id}"),
+                InlineKeyboardButton("Cancel Run", callback_data=f"clip:cancel:{run.id}"),
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
 
     def _format_highlight_review(self, run) -> str:
         lines = [f"Run Log {run.id} highlight candidates:"]

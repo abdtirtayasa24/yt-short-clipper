@@ -695,7 +695,7 @@ class ManualClippingService:
 
     def select_candidates(self, session: Session, run_id: int, numbers: list[int]) -> bool:
         run = session.get(RunLog, run_id)
-        if run is None or run.status != "awaiting_selection":
+        if run is None or run.status not in {"awaiting_selection", "selection_ready"}:
             return False
         selected = set(numbers)
         for candidate in run.highlight_candidates:
@@ -705,6 +705,27 @@ class ManualClippingService:
         self.add_event(session, run, "selected", f"Selected highlights: {run.selected_highlights}")
         session.commit()
         return True
+
+    def toggle_candidate_selection(self, session: Session, run_id: int, candidate_number: int) -> bool | None:
+        run = session.get(RunLog, run_id)
+        if run is None or run.status not in {"awaiting_selection", "selection_ready"}:
+            return None
+        candidate = next(
+            (item for item in run.highlight_candidates if item.candidate_number == candidate_number),
+            None,
+        )
+        if candidate is None:
+            return None
+        candidate.selected = not candidate.selected
+        selected_numbers = [
+            item.candidate_number for item in sorted(run.highlight_candidates, key=lambda item: item.candidate_number) if item.selected
+        ]
+        run.selected_highlights = ",".join(str(number) for number in selected_numbers) or None
+        run.status = "selection_ready" if selected_numbers else "awaiting_selection"
+        action = "Selected" if candidate.selected else "Unselected"
+        self.add_event(session, run, "selected", f"{action} highlight {candidate.candidate_number}")
+        session.commit()
+        return candidate.selected
 
     def process_selected_run(self, session: Session, settings: Settings, run_id: int) -> list[str]:
         run = session.get(RunLog, run_id)
@@ -833,7 +854,7 @@ class ManualClippingService:
 
     def cancel_run(self, session: Session, run_id: int) -> bool:
         run = session.get(RunLog, run_id)
-        if run is None or run.status not in {"finding_highlights", "awaiting_selection"}:
+        if run is None or run.status not in {"finding_highlights", "awaiting_selection", "selection_ready"}:
             return False
         run.status = "cancelled"
         self.add_event(session, run, "cancelled", "Manual Clipping cancelled")
