@@ -30,7 +30,15 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-3. Start the Combined Bot Server:
+3. Export YouTube browser cookies to `cookies.txt` and place the file in the service working directory:
+
+```text
+/home/ubuntu/yt-short-clipper/cookies.txt
+```
+
+The service runs as `ubuntu`, so make sure that user can read the file.
+
+4. Start the Combined Bot Server:
 
 ```bash
 uvicorn bot_app.main:create_app --factory --host 0.0.0.0 --port 8000

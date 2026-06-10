@@ -748,7 +748,11 @@ Transcript:
                 break
         
         if not cookies_path:
-            raise Exception("cookies.txt not found!\n\nPlease upload cookies.txt file from home page.")
+            raise Exception(
+                "cookies.txt not found!\n\n"
+                "For Bot Control Mode, place your exported YouTube cookies file at "
+                "/home/ubuntu/yt-short-clipper/cookies.txt or ./cookies.txt relative to the service WorkingDirectory."
+            )
         
         ydl_opts['cookiefile'] = str(cookies_path)
         self.log(f"  Using cookies from: {cookies_path}")
@@ -1499,7 +1503,11 @@ Transcript:
                 break
         
         if not cookies_path:
-            raise Exception("cookies.txt not found!\n\nPlease upload cookies.txt file from home page.")
+            raise Exception(
+                "cookies.txt not found!\n\n"
+                "For Bot Control Mode, place your exported YouTube cookies file at "
+                "/home/ubuntu/yt-short-clipper/cookies.txt or ./cookies.txt relative to the service WorkingDirectory."
+            )
         
         ydl_opts['cookiefile'] = str(cookies_path)
         
