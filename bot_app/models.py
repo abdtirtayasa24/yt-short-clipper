@@ -9,6 +9,24 @@ class Base(DeclarativeBase):
     pass
 
 
+class PublishAttempt(Base):
+    """Publishing result for one generated clip and platform."""
+
+    __tablename__ = "publish_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    clip_record_id: Mapped[int] = mapped_column(ForeignKey("clip_records.id"), nullable=False, index=True)
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    platform_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 class ScheduleSlot(Base):
     """Enabled daily or weekly Scheduled Source URL slot."""
 

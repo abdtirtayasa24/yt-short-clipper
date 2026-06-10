@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     app_timezone: str = "Asia/Jakarta"
     clip_archive_dir: Path = Path("clip_archive")
     clip_retention_days: int = Field(default=30, ge=1)
+    youtube_credentials_path: Path = Path("credentials/youtube.json")
+    tiktok_session_path: Path = Path("credentials/tiktok.session")
 
     telegram_bot_token: str
     telegram_authorized_chat_id: int

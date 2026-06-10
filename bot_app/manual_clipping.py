@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from bot_app.ai_providers import GeminiTextProvider
 from bot_app.clip_archive import create_clip_record
 from bot_app.database import ensure_workflow_defaults
-from bot_app.models import HighlightCandidate, RunEvent, RunLog
+from bot_app.models import ClipRecord, HighlightCandidate, PublishAttempt, RunEvent, RunLog
 from bot_app.settings import Settings
 
 
@@ -32,6 +32,11 @@ class HighlightDraft:
 
 class HighlightFinder(Protocol):
     def find_highlights(self, youtube_url: str, count: int) -> list[HighlightDraft]:
+        ...
+
+
+class Publisher(Protocol):
+    def publish(self, clip: ClipRecord, metadata: PublishingMetadata) -> str:
         ...
 
 
@@ -128,12 +133,16 @@ class ManualClippingService:
         clip_processor: ClipProcessor | None = None,
         clipping_queue: ClippingQueue | None = None,
         metadata_generator: MetadataGenerator | None = None,
+        youtube_publisher: Publisher | None = None,
+        tiktok_publisher: Publisher | None = None,
     ):
         self.settings = settings
         self.highlight_finder = highlight_finder or GeminiHighlightFinder(settings)
         self.clip_processor = clip_processor or ExistingClipProcessor()
         self.clipping_queue = clipping_queue or ClippingQueue()
         self.metadata_generator = metadata_generator or GeminiMetadataGenerator(settings)
+        self.youtube_publisher = youtube_publisher
+        self.tiktok_publisher = tiktok_publisher
 
     def start_run(self, session: Session, youtube_url: str) -> RunLog:
         defaults = ensure_workflow_defaults(session)
@@ -219,7 +228,11 @@ class ManualClippingService:
                     generated_description=metadata.description,
                     generated_hashtags=" ".join(metadata.hashtags),
                 )
-                links.append(f"{metadata.title}: {clip.public_clip_link}")
+                summary = f"{metadata.title}: {clip.public_clip_link}"
+                publish_summaries = self._publish_clip(session, defaults, clip, metadata)
+                if publish_summaries:
+                    summary = summary + "\n" + "\n".join(publish_summaries)
+                links.append(summary)
                 self.add_event(session, run, "clip_archived", clip.public_clip_link)
             run.status = "processed"
             self.add_event(session, run, "processed", f"Generated {len(links)} Public Clip Links")
@@ -233,6 +246,44 @@ class ManualClippingService:
             raise
         finally:
             self.clipping_queue.finish(run_id)
+
+    def _publish_clip(
+        self,
+        session: Session,
+        defaults,
+        clip: ClipRecord,
+        metadata: PublishingMetadata,
+    ) -> list[str]:
+        summaries = []
+        publishers = []
+        if defaults.publish_youtube:
+            publishers.append(("youtube", self.youtube_publisher))
+        if defaults.publish_tiktok:
+            publishers.append(("tiktok", self.tiktok_publisher))
+
+        for platform, publisher in publishers:
+            try:
+                if publisher is None:
+                    raise RuntimeError(f"{platform} preauthorized publisher is not configured")
+                platform_url = publisher.publish(clip, metadata)
+                attempt = PublishAttempt(
+                    clip_record_id=clip.id,
+                    platform=platform,
+                    status="published",
+                    platform_url=platform_url,
+                )
+                summaries.append(f"{platform}: published {platform_url}")
+            except Exception as exc:
+                attempt = PublishAttempt(
+                    clip_record_id=clip.id,
+                    platform=platform,
+                    status="failed",
+                    error_message=str(exc),
+                )
+                summaries.append(f"{platform}: failed {exc}")
+            session.add(attempt)
+        session.commit()
+        return summaries
 
     def cancel_run(self, session: Session, run_id: int) -> bool:
         run = session.get(RunLog, run_id)

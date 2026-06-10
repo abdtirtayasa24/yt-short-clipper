@@ -10,7 +10,7 @@ from bot_app.clip_archive import create_clip_record
 from bot_app.manual_clipping import HighlightDraft, ManualClippingService, PublishingMetadata
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
-from bot_app.models import ClipRecord, HighlightCandidate, RunEvent, RunLog, WorkflowDefaults
+from bot_app.models import ClipRecord, HighlightCandidate, PublishAttempt, RunEvent, RunLog, WorkflowDefaults
 from bot_app.scheduler import fire_schedule
 from bot_app.source_queue import consume_source_video, get_pending_source_videos
 from bot_app.settings import Settings
@@ -162,6 +162,16 @@ def test_authorized_operator_can_start_select_and_cancel_manual_clipping(tmp_pat
     asyncio.run(run_test())
 
 
+class FakePublisher:
+    def __init__(self, platform):
+        self.platform = platform
+        self.calls = []
+
+    def publish(self, clip, metadata):
+        self.calls.append((clip.archive_path, metadata.title))
+        return f"https://{self.platform}.example.com/{clip.clip_id}"
+
+
 class FakeMetadataGenerator:
     def __init__(self):
         self.calls = []
@@ -188,6 +198,26 @@ class FakeClipProcessor:
         return output_path
 
 
+def test_auth_command_reports_preauthorization_status(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        settings.youtube_credentials_path = tmp_path / "youtube.json"
+        settings.tiktok_session_path = tmp_path / "tiktok.session"
+        settings.youtube_credentials_path.write_text("{}")
+        bot = AuthorizedOperatorTelegramBot(settings)
+
+        auth_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_auth(auth_update, FakeContext()) is True
+        reply = auth_update.message.replies[0]
+        assert "YouTube: preauthorized" in reply
+        assert "TikTok: missing" in reply
+        assert "Preauthorization Setup" in reply
+        assert "VPS" in reply
+
+    asyncio.run(run_test())
+
+
 def test_authorized_operator_processes_selected_highlights_into_public_clip_links(tmp_path):
     async def run_test():
         settings = make_settings(tmp_path)
@@ -195,11 +225,15 @@ def test_authorized_operator_processes_selected_highlights_into_public_clip_link
         finder = FakeHighlightFinder()
         processor = FakeClipProcessor(settings.clip_archive_dir)
         metadata_generator = FakeMetadataGenerator()
+        youtube_publisher = FakePublisher("youtube")
+        tiktok_publisher = FakePublisher("tiktok")
         service = ManualClippingService(
             settings,
             finder,
             clip_processor=processor,
             metadata_generator=metadata_generator,
+            youtube_publisher=youtube_publisher,
+            tiktok_publisher=tiktok_publisher,
         )
         bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
 
@@ -211,6 +245,14 @@ def test_authorized_operator_processes_selected_highlights_into_public_clip_link
             FakeUpdate(settings.telegram_authorized_chat_id),
             FakeContext(["select", "1", "1", "3"]),
         ) is True
+        assert await bot.handle_defaults(
+            FakeUpdate(settings.telegram_authorized_chat_id),
+            FakeContext(["set", "publish_youtube", "on"]),
+        ) is True
+        assert await bot.handle_defaults(
+            FakeUpdate(settings.telegram_authorized_chat_id),
+            FakeContext(["set", "publish_tiktok", "on"]),
+        ) is True
 
         process_update = FakeUpdate(settings.telegram_authorized_chat_id)
         assert await bot.handle_clip(process_update, FakeContext(["process", "1"])) is True
@@ -219,6 +261,8 @@ def test_authorized_operator_processes_selected_highlights_into_public_clip_link
         assert "download" in reply
         assert "Title 1" in reply
         assert "Title 3" in reply
+        assert "youtube: published https://youtube.example.com/" in reply
+        assert "tiktok: published https://tiktok.example.com/" in reply
         assert processor.calls == [
             ("https://youtu.be/manual", 1, True, True),
             ("https://youtu.be/manual", 3, True, True),
@@ -238,6 +282,10 @@ def test_authorized_operator_processes_selected_highlights_into_public_clip_link
             assert [clip.generated_description for clip in clips] == ["Description 1", "Description 3"]
             assert all(clip.generated_hashtags == "#shorts #viral" for clip in clips)
             assert all(clip.public_clip_link in reply for clip in clips)
+            attempts = session.scalars(select(PublishAttempt).order_by(PublishAttempt.id)).all()
+            assert len(attempts) == 4
+            assert {attempt.platform for attempt in attempts} == {"youtube", "tiktok"}
+            assert all(attempt.status == "published" for attempt in attempts)
 
     asyncio.run(run_test())
 

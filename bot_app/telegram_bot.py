@@ -44,6 +44,7 @@ class AuthorizedOperatorTelegramBot:
         self.application.add_handler(CommandHandler("sources", self.handle_sources))
         self.application.add_handler(CommandHandler("clip", self.handle_clip))
         self.application.add_handler(CommandHandler("schedule", self.handle_schedule))
+        self.application.add_handler(CommandHandler("auth", self.handle_auth))
         self.started = True
 
     async def stop(self) -> None:
@@ -71,13 +72,26 @@ class AuthorizedOperatorTelegramBot:
     async def handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
             return False
-        await update.message.reply_text("Available commands: /start, /help, /status, /defaults, /sources, /clip, /schedule")
+        await update.message.reply_text("Available commands: /start, /help, /status, /defaults, /sources, /clip, /schedule, /auth")
         return True
 
     async def handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
             return False
         await update.message.reply_text("Bot Control Mode status: ok")
+        return True
+
+    async def handle_auth(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        if await self._reject_unknown_chat(update):
+            return False
+        youtube_status = "preauthorized" if self.settings.youtube_credentials_path.exists() else "missing"
+        tiktok_status = "preauthorized" if self.settings.tiktok_session_path.exists() else "missing"
+        await update.message.reply_text(
+            "Preauthorization Setup status for VPS deployment:\n"
+            f"YouTube: {youtube_status} ({self.settings.youtube_credentials_path})\n"
+            f"TikTok: {tiktok_status} ({self.settings.tiktok_session_path})\n"
+            "Run one-time local setup to create these files before enabling scheduled Publishing."
+        )
         return True
 
     async def handle_schedule(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
