@@ -11,7 +11,7 @@ from bot_app.manual_clipping import GeminiHighlightFinder, HighlightDraft, Manua
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
 from bot_app.models import ClipRecord, HighlightCandidate, PublishAttempt, RunEvent, RunLog, WorkflowDefaults
-from bot_app.scheduler import fire_schedule
+from bot_app.scheduler import add_daily_schedule, fire_schedule
 from bot_app.source_queue import add_source_videos, consume_source_video, get_pending_source_videos
 from bot_app.settings import Settings
 from bot_app.telegram_bot import AuthorizedOperatorTelegramBot
@@ -147,7 +147,7 @@ def test_telegram_bot_start_polls_for_updates_and_stop_shuts_down(monkeypatch, t
         await bot.start()
 
         assert bot.started is True
-        assert len(fake_application.handlers) == 14
+        assert len(fake_application.handlers) == 15
         assert fake_application.calls == [
             ("initialize", {}),
             ("start_polling", {"drop_pending_updates": True}),
@@ -1201,6 +1201,47 @@ def test_source_queue_consumes_pending_videos_once_and_rejects_unknown_chats(tmp
         list_update = FakeUpdate(settings.telegram_authorized_chat_id)
         assert await bot.handle_sources(list_update, FakeContext(["list"])) is True
         assert "consumed" in list_update.message.replies[0]
+
+    asyncio.run(run_test())
+
+
+def test_schedule_command_displays_inline_controls_and_callbacks_mutate_slots(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+        with create_session_factory(settings.database_url)() as session:
+            add_daily_schedule(session, settings, "09:00")
+
+        schedule_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_schedule(schedule_update, FakeContext()) is True
+        assert "Schedules:" in schedule_update.message.replies[0]
+        callback_data = [button.callback_data for row in schedule_update.message.reply_markups[0].inline_keyboard for button in row]
+        assert "schedule:add_daily" in callback_data
+        assert "schedule:add_weekly" in callback_data
+        assert "schedule:list" in callback_data
+        assert "schedule:disable:1" in callback_data
+        assert "schedule:delete:1" in callback_data
+
+        prompt = FakeCallbackQuery("schedule:add_daily")
+        assert await bot.handle_schedule_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=prompt), FakeContext()) is True
+        assert "/schedule add daily" in prompt.edits[0]
+
+        disable = FakeCallbackQuery("schedule:disable:1")
+        assert await bot.handle_schedule_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=disable), FakeContext()) is True
+        assert "disabled" in disable.edits[0]
+
+        enable = FakeCallbackQuery("schedule:enable:1")
+        assert await bot.handle_schedule_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=enable), FakeContext()) is True
+        assert "enabled" in enable.edits[0]
+
+        delete = FakeCallbackQuery("schedule:delete:1")
+        assert await bot.handle_schedule_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=delete), FakeContext()) is True
+        assert "No schedules configured" in delete.edits[0]
+
+        unauthorized = FakeCallbackQuery("schedule:list")
+        assert await bot.handle_schedule_callback(FakeUpdate(999, callback_query=unauthorized), FakeContext()) is False
+        assert unauthorized.answers == ["Unauthorized chat."]
 
     asyncio.run(run_test())
 

@@ -58,11 +58,24 @@ def list_schedules(session: Session) -> list[ScheduleSlot]:
     return list(session.scalars(select(ScheduleSlot).order_by(ScheduleSlot.id)).all())
 
 
-def remove_schedule(session: Session, schedule_id: int) -> bool:
+def set_schedule_enabled(session: Session, schedule_id: int, enabled: bool) -> bool:
     slot = session.get(ScheduleSlot, schedule_id)
     if slot is None:
         return False
-    slot.enabled = False
+    slot.enabled = enabled
+    session.commit()
+    return True
+
+
+def remove_schedule(session: Session, schedule_id: int) -> bool:
+    return set_schedule_enabled(session, schedule_id, False)
+
+
+def delete_schedule(session: Session, schedule_id: int) -> bool:
+    slot = session.get(ScheduleSlot, schedule_id)
+    if slot is None:
+        return False
+    session.delete(slot)
     session.commit()
     return True
 

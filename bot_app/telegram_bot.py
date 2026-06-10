@@ -7,7 +7,7 @@ from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, 
 from bot_app.database import create_session_factory, ensure_workflow_defaults, initialize_database
 from bot_app.manual_clipping import ManualClippingService, TelegramVideoUpload
 from bot_app.models import RunLog, SourceVideo
-from bot_app.scheduler import add_daily_schedule, add_weekly_schedule, list_schedules, remove_schedule
+from bot_app.scheduler import add_daily_schedule, add_weekly_schedule, delete_schedule, list_schedules, remove_schedule, set_schedule_enabled
 from bot_app.settings import Settings
 from bot_app.source_queue import add_source_videos, cancel_pending_source_video, get_source_videos
 
@@ -49,6 +49,7 @@ class AuthorizedOperatorTelegramBot:
         self.application.add_handler(CommandHandler("schedule", self.handle_schedule))
         self.application.add_handler(CommandHandler("auth", self.handle_auth))
         self.application.add_handler(CommandHandler("cancel", self.handle_cancel))
+        self.application.add_handler(CallbackQueryHandler(self.handle_schedule_callback, pattern=r"^schedule:"))
         self.application.add_handler(CallbackQueryHandler(self.handle_sources_callback, pattern=r"^sources:"))
         self.application.add_handler(CallbackQueryHandler(self.handle_defaults_callback, pattern=r"^defaults:"))
         self.application.add_handler(CallbackQueryHandler(self.handle_menu_callback, pattern=r"^menu:"))
@@ -131,7 +132,7 @@ class AuthorizedOperatorTelegramBot:
         if action == "schedule":
             with self.session_factory() as session:
                 text = self._format_schedules(session)
-            await query.edit_message_text(text, reply_markup=self._home_menu_markup())
+            await query.edit_message_text(text, reply_markup=self._schedules_markup())
             return True
         if action == "defaults":
             await query.edit_message_text(self._format_workflow_defaults(), reply_markup=self._workflow_defaults_markup())
@@ -212,8 +213,11 @@ class AuthorizedOperatorTelegramBot:
 
         args = list(getattr(context, "args", []) or [])
         with self.session_factory() as session:
+            if not args:
+                await update.message.reply_text(self._format_schedules(session), reply_markup=self._schedules_markup())
+                return True
             if args == ["list"]:
-                await update.message.reply_text(self._format_schedules(session))
+                await update.message.reply_text(self._format_schedules(session), reply_markup=self._schedules_markup())
                 return True
             if len(args) == 3 and args[0] == "add" and args[1] == "daily":
                 slot = add_daily_schedule(session, self.settings, args[2])
@@ -234,6 +238,68 @@ class AuthorizedOperatorTelegramBot:
 
         await update.message.reply_text(self._schedule_usage())
         return False
+
+    async def handle_schedule_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        query = getattr(update, "callback_query", None)
+        if query is None:
+            return False
+        if await self._reject_unknown_chat(update):
+            await query.answer("Unauthorized chat.")
+            return False
+        parts = str(getattr(query, "data", "")).split(":")
+        action = parts[1] if len(parts) >= 2 and parts[0] == "schedule" else ""
+        if action == "add_daily":
+            await query.answer()
+            await query.edit_message_text(
+                "Add a daily Schedule Slot with /schedule add daily <HH:MM>.",
+                reply_markup=self._schedules_markup(),
+            )
+            return True
+        if action == "add_weekly":
+            await query.answer()
+            await query.edit_message_text(
+                "Add a weekly Schedule Slot with /schedule add weekly <weekday> <HH:MM>.",
+                reply_markup=self._schedules_markup(),
+            )
+            return True
+        if action == "list":
+            await query.answer()
+            with self.session_factory() as session:
+                text = self._format_schedules(session)
+            await query.edit_message_text(text, reply_markup=self._schedules_markup())
+            return True
+        if action in {"enable", "disable", "delete"} and len(parts) == 3 and parts[2].isdigit():
+            schedule_id = int(parts[2])
+            with self.session_factory() as session:
+                if action == "delete":
+                    changed = delete_schedule(session, schedule_id)
+                else:
+                    changed = set_schedule_enabled(session, schedule_id, action == "enable")
+            await query.answer("Schedule updated." if changed else "Unable to update Schedule Slot.")
+            with self.session_factory() as session:
+                text = self._format_schedules(session)
+            await query.edit_message_text(text, reply_markup=self._schedules_markup())
+            return changed
+        await query.answer("Unknown Schedule action.")
+        return False
+
+    def _schedules_markup(self) -> InlineKeyboardMarkup:
+        rows = [
+            [InlineKeyboardButton("Add Daily", callback_data="schedule:add_daily")],
+            [InlineKeyboardButton("Add Weekly", callback_data="schedule:add_weekly")],
+            [InlineKeyboardButton("Refresh Schedules", callback_data="schedule:list")],
+        ]
+        with self.session_factory() as session:
+            for slot in list_schedules(session):
+                toggle_action = "disable" if slot.enabled else "enable"
+                toggle_label = "Disable" if slot.enabled else "Enable"
+                rows.append(
+                    [
+                        InlineKeyboardButton(f"{toggle_label} #{slot.id}", callback_data=f"schedule:{toggle_action}:{slot.id}"),
+                        InlineKeyboardButton(f"Delete #{slot.id}", callback_data=f"schedule:delete:{slot.id}"),
+                    ]
+                )
+        return InlineKeyboardMarkup(rows)
 
     def _format_schedules(self, session) -> str:
         schedules = list_schedules(session)
