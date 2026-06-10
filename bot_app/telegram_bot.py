@@ -49,6 +49,7 @@ class AuthorizedOperatorTelegramBot:
         self.application.add_handler(CommandHandler("schedule", self.handle_schedule))
         self.application.add_handler(CommandHandler("auth", self.handle_auth))
         self.application.add_handler(CommandHandler("cancel", self.handle_cancel))
+        self.application.add_handler(CallbackQueryHandler(self.handle_defaults_callback, pattern=r"^defaults:"))
         self.application.add_handler(CallbackQueryHandler(self.handle_menu_callback, pattern=r"^menu:"))
         self.application.add_handler(CallbackQueryHandler(self.handle_clip_callback, pattern=r"^clip:"))
         self.application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, self.handle_video_upload))
@@ -132,7 +133,7 @@ class AuthorizedOperatorTelegramBot:
             await query.edit_message_text(text, reply_markup=self._home_menu_markup())
             return True
         if action == "defaults":
-            await query.edit_message_text(self._format_workflow_defaults(), reply_markup=self._home_menu_markup())
+            await query.edit_message_text(self._format_workflow_defaults(), reply_markup=self._workflow_defaults_markup())
             return True
         if action == "status":
             await query.edit_message_text(self._status_text(), reply_markup=self._home_menu_markup())
@@ -522,7 +523,7 @@ class AuthorizedOperatorTelegramBot:
 
         args = list(getattr(context, "args", []) or [])
         if not args:
-            await update.message.reply_text(self._format_workflow_defaults())
+            await update.message.reply_text(self._format_workflow_defaults(), reply_markup=self._workflow_defaults_markup())
             return True
 
         if len(args) != 3 or args[0] != "set":
@@ -537,6 +538,45 @@ class AuthorizedOperatorTelegramBot:
         await update.message.reply_text(f"Updated {self._format_default_value(field, value)}")
         return True
 
+    async def handle_defaults_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        query = getattr(update, "callback_query", None)
+        if query is None:
+            return False
+        if await self._reject_unknown_chat(update):
+            await query.answer("Unauthorized chat.")
+            return False
+        parts = str(getattr(query, "data", "")).split(":")
+        if len(parts) != 3 or parts[0] != "defaults" or parts[1] != "toggle":
+            await query.answer("Unknown defaults action.")
+            return False
+        if not self._toggle_workflow_default(parts[2]):
+            await query.answer("Unsupported default.")
+            return False
+        await query.answer("Workflow Default updated.")
+        await query.edit_message_text(self._format_workflow_defaults(), reply_markup=self._workflow_defaults_markup())
+        return True
+
+    def _workflow_defaults_markup(self) -> InlineKeyboardMarkup:
+        with self.session_factory() as session:
+            defaults = ensure_workflow_defaults(session)
+            rows = [
+                [InlineKeyboardButton(f"Captions: {self._on_off(defaults.captions_enabled)}", callback_data="defaults:toggle:captions")],
+                [InlineKeyboardButton(f"Hooks: {self._on_off(defaults.hooks_enabled)}", callback_data="defaults:toggle:hooks")],
+                [
+                    InlineKeyboardButton(
+                        f"YouTube Publish: {self._on_off(defaults.publish_youtube)} ({self._publisher_auth_status('youtube')})",
+                        callback_data="defaults:toggle:publish_youtube",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"TikTok Publish: {self._on_off(defaults.publish_tiktok)} ({self._publisher_auth_status('tiktok')})",
+                        callback_data="defaults:toggle:publish_tiktok",
+                    )
+                ],
+            ]
+        return InlineKeyboardMarkup(rows)
+
     def _format_workflow_defaults(self) -> str:
         with self.session_factory() as session:
             defaults = ensure_workflow_defaults(session)
@@ -548,8 +588,33 @@ class AuthorizedOperatorTelegramBot:
                     f"publish_youtube: {self._on_off(defaults.publish_youtube)}",
                     f"publish_tiktok: {self._on_off(defaults.publish_tiktok)}",
                     f"subtitle_language: {defaults.subtitle_language}",
+                    f"YouTube preauth: {self._publisher_auth_status('youtube')}",
+                    f"TikTok preauth: {self._publisher_auth_status('tiktok')}",
                 ]
             )
+
+    def _publisher_auth_status(self, platform: str) -> str:
+        if platform == "youtube":
+            return "preauthorized" if self.settings.youtube_credentials_path.exists() else "missing"
+        if platform == "tiktok":
+            return "preauthorized" if self.settings.tiktok_session_path.exists() else "missing"
+        return "missing"
+
+    def _toggle_workflow_default(self, field: str) -> bool:
+        boolean_fields = {
+            "captions": "captions_enabled",
+            "hooks": "hooks_enabled",
+            "publish_youtube": "publish_youtube",
+            "publish_tiktok": "publish_tiktok",
+        }
+        column = boolean_fields.get(field)
+        if column is None:
+            return False
+        with self.session_factory() as session:
+            defaults = ensure_workflow_defaults(session)
+            setattr(defaults, column, not getattr(defaults, column))
+            session.commit()
+            return True
 
     def _set_workflow_default(self, field: str, value: str) -> bool:
         boolean_fields = {

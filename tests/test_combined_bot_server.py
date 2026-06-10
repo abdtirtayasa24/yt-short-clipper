@@ -147,7 +147,7 @@ def test_telegram_bot_start_polls_for_updates_and_stop_shuts_down(monkeypatch, t
         await bot.start()
 
         assert bot.started is True
-        assert len(fake_application.handlers) == 12
+        assert len(fake_application.handlers) == 13
         assert fake_application.calls == [
             ("initialize", {}),
             ("start_polling", {"drop_pending_updates": True}),
@@ -892,6 +892,56 @@ def test_inline_highlight_buttons_toggle_process_cancel_and_reject_unauthorized(
         unauthorized = FakeCallbackQuery("clip:toggle:1:1")
         assert await bot.handle_clip_callback(FakeUpdate(999, callback_query=unauthorized), FakeContext()) is False
         assert unauthorized.answers == ["Unauthorized chat."]
+
+    asyncio.run(run_test())
+
+
+def test_defaults_command_shows_inline_toggles_and_callbacks_update_defaults(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+
+        defaults_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_defaults(defaults_update, FakeContext()) is True
+        assert "Workflow Defaults" in defaults_update.message.replies[0]
+        assert "YouTube preauth: missing" in defaults_update.message.replies[0]
+        callback_data = [button.callback_data for row in defaults_update.message.reply_markups[0].inline_keyboard for button in row]
+        assert "defaults:toggle:captions" in callback_data
+        assert "defaults:toggle:publish_youtube" in callback_data
+
+        captions = FakeCallbackQuery("defaults:toggle:captions")
+        assert await bot.handle_defaults_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=captions), FakeContext()) is True
+        assert "captions: off" in captions.edits[0]
+
+        youtube = FakeCallbackQuery("defaults:toggle:publish_youtube")
+        assert await bot.handle_defaults_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=youtube), FakeContext()) is True
+        assert "publish_youtube: on" in youtube.edits[0]
+        assert "YouTube preauth: missing" in youtube.edits[0]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            defaults = session.get(WorkflowDefaults, 1)
+            assert defaults.captions_enabled is False
+            assert defaults.publish_youtube is True
+
+    asyncio.run(run_test())
+
+
+def test_defaults_callback_rejects_unauthorized_chat(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+        query = FakeCallbackQuery("defaults:toggle:captions")
+
+        assert await bot.handle_defaults_callback(FakeUpdate(999, callback_query=query), FakeContext()) is False
+        assert query.answers == ["Unauthorized chat."]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            defaults = session.get(WorkflowDefaults, 1)
+            assert defaults.captions_enabled is True
 
     asyncio.run(run_test())
 
