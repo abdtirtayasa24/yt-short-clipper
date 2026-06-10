@@ -643,6 +643,7 @@ class ManualClippingService:
         session.commit()
         session.refresh(run)
         target_path = self.settings.source_video_dir / str(run.id) / filename
+        target_path.parent.mkdir(parents=True, exist_ok=True)
         run.source_path = str(target_path)
         self.add_event(session, run, "started", "Manual Clipping started from Telegram upload")
         session.commit()

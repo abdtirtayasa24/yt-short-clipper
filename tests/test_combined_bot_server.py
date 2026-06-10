@@ -400,7 +400,6 @@ class FakeTelegramFile:
 
     async def download_to_drive(self, custom_path):
         path = Path(custom_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(self.body)
         self.downloads.append(path)
         return path
