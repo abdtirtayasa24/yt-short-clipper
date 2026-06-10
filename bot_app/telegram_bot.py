@@ -49,9 +49,19 @@ class AuthorizedOperatorTelegramBot:
         self.application.add_handler(CommandHandler("schedule", self.handle_schedule))
         self.application.add_handler(CommandHandler("auth", self.handle_auth))
         self.application.add_handler(CommandHandler("cancel", self.handle_cancel))
+        await self.application.initialize()
+        if self.application.updater is None:
+            raise RuntimeError("Telegram bot requires an updater for polling")
+        await self.application.updater.start_polling(drop_pending_updates=True)
+        await self.application.start()
         self.started = True
 
     async def stop(self) -> None:
+        if self.application is not None:
+            if self.application.updater is not None:
+                await self.application.updater.stop()
+            await self.application.stop()
+            await self.application.shutdown()
         self.started = False
         self.application = None
 

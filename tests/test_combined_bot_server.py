@@ -65,6 +65,83 @@ class FakeTelegramBot:
         self.stopped = True
 
 
+class FakeUpdater:
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def start_polling(self, **kwargs):
+        self.calls.append(("start_polling", kwargs))
+
+    async def stop(self):
+        self.calls.append(("updater_stop", {}))
+
+
+class FakeTelegramApplication:
+    def __init__(self):
+        self.calls = []
+        self.handlers = []
+        self.updater = FakeUpdater(self.calls)
+
+    def add_handler(self, handler):
+        self.handlers.append(handler)
+
+    async def initialize(self):
+        self.calls.append(("initialize", {}))
+
+    async def start(self):
+        self.calls.append(("application_start", {}))
+
+    async def stop(self):
+        self.calls.append(("application_stop", {}))
+
+    async def shutdown(self):
+        self.calls.append(("shutdown", {}))
+
+
+class FakeApplicationBuilder:
+    def __init__(self, application):
+        self.application = application
+
+    def token(self, token):
+        self.token_value = token
+        return self
+
+    def build(self):
+        return self.application
+
+
+def test_telegram_bot_start_polls_for_updates_and_stop_shuts_down(monkeypatch, tmp_path):
+    settings = make_settings(tmp_path)
+    fake_application = FakeTelegramApplication()
+    monkeypatch.setattr(
+        "bot_app.telegram_bot.ApplicationBuilder",
+        lambda: FakeApplicationBuilder(fake_application),
+    )
+
+    async def run_test():
+        bot = AuthorizedOperatorTelegramBot(settings)
+        await bot.start()
+
+        assert bot.started is True
+        assert len(fake_application.handlers) == 9
+        assert fake_application.calls == [
+            ("initialize", {}),
+            ("start_polling", {"drop_pending_updates": True}),
+            ("application_start", {}),
+        ]
+
+        await bot.stop()
+
+        assert bot.started is False
+        assert fake_application.calls[-3:] == [
+            ("updater_stop", {}),
+            ("application_stop", {}),
+            ("shutdown", {}),
+        ]
+
+    asyncio.run(run_test())
+
+
 def test_fastapi_lifespan_starts_and_stops_telegram_bot(tmp_path):
     settings = make_settings(tmp_path)
     telegram_bot = FakeTelegramBot()
@@ -753,7 +830,7 @@ def test_public_clip_link_downloads_recorded_archive_file(tmp_path):
         assert clip.expires_at is not None
         assert clip.expires_at.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc)
 
-    app = create_app(settings)
+    app = create_app(settings, telegram_bot=FakeTelegramBot())
     with TestClient(app) as client:
         response = client.get(f"/clips/{clip.clip_id}/download")
 
@@ -786,7 +863,7 @@ def test_public_clip_link_rejects_unknown_missing_expired_deleted_and_unsafe_rec
         deleted = create_clip_record(session, settings, deleted_file, deleted_at=datetime.now(timezone.utc))
         unsafe = create_clip_record(session, settings, unsafe_file)
 
-    app = create_app(settings)
+    app = create_app(settings, telegram_bot=FakeTelegramBot())
     with TestClient(app) as client:
         assert client.get("/clips/unknown/download").status_code == 404
         assert client.get(f"/clips/{missing.clip_id}/download").status_code == 404
@@ -799,7 +876,7 @@ def test_public_clip_link_rejects_unknown_missing_expired_deleted_and_unsafe_rec
 def test_combined_bot_server_reports_health_and_creates_workflow_defaults(tmp_path):
     settings = make_settings(tmp_path)
 
-    app = create_app(settings)
+    app = create_app(settings, telegram_bot=FakeTelegramBot())
     with TestClient(app) as client:
         response = client.get("/health")
 
