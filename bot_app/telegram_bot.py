@@ -1,10 +1,12 @@
 from typing import Protocol
 
+from sqlalchemy import func, select
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
-from bot_app.database import create_session_factory, ensure_workflow_defaults
+from bot_app.database import create_session_factory, ensure_workflow_defaults, initialize_database
 from bot_app.manual_clipping import ManualClippingService
+from bot_app.models import RunLog, SourceVideo
 from bot_app.scheduler import add_daily_schedule, add_weekly_schedule, list_schedules, remove_schedule
 from bot_app.settings import Settings
 from bot_app.source_queue import add_source_videos, cancel_pending_source_video, get_source_videos
@@ -23,6 +25,7 @@ class AuthorizedOperatorTelegramBot:
 
     def __init__(self, settings: Settings, manual_clipping_service: ManualClippingService | None = None):
         self.settings = settings
+        initialize_database(settings.database_url)
         self.session_factory = create_session_factory(settings.database_url)
         self.manual_clipping_service = manual_clipping_service or ManualClippingService(settings)
         self.application: Application | None = None
@@ -45,6 +48,7 @@ class AuthorizedOperatorTelegramBot:
         self.application.add_handler(CommandHandler("clip", self.handle_clip))
         self.application.add_handler(CommandHandler("schedule", self.handle_schedule))
         self.application.add_handler(CommandHandler("auth", self.handle_auth))
+        self.application.add_handler(CommandHandler("cancel", self.handle_cancel))
         self.started = True
 
     async def stop(self) -> None:
@@ -78,8 +82,44 @@ class AuthorizedOperatorTelegramBot:
     async def handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
             return False
-        await update.message.reply_text("Bot Control Mode status: ok")
+        with self.session_factory() as session:
+            active_run = self.manual_clipping_service.clipping_queue.active_run_id
+            queued_runs = session.scalar(select(func.count()).select_from(RunLog).where(RunLog.status == "queued"))
+            recent_runs = session.scalars(select(RunLog).order_by(RunLog.id.desc()).limit(5)).all()
+            source_counts = {
+                status: count
+                for status, count in session.execute(
+                    select(SourceVideo.status, func.count()).group_by(SourceVideo.status)
+                ).all()
+            }
+        source_summary = ", ".join(f"{status}={count}" for status, count in sorted(source_counts.items())) or "none"
+        recent_summary = ", ".join(f"#{run.id} {run.status}" for run in recent_runs) or "none"
+        await update.message.reply_text(
+            "Bot Control Mode status: ok\n"
+            f"active run: {active_run or 'none'}\n"
+            f"queued runs: {queued_runs}\n"
+            f"recent runs: {recent_summary}\n"
+            f"Source Video Queue: {source_summary}"
+        )
         return True
+
+    async def handle_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        if await self._reject_unknown_chat(update):
+            return False
+        active_run = self.manual_clipping_service.clipping_queue.active_run_id
+        with self.session_factory() as session:
+            if active_run is not None and self.manual_clipping_service.request_cancellation(session, active_run):
+                await update.message.reply_text(f"Cancellation requested for Run Log {active_run}.")
+                return True
+            queued_run = session.scalars(select(RunLog).where(RunLog.status == "queued").order_by(RunLog.id)).first()
+            if queued_run is not None:
+                queued_run.status = "cancelled"
+                self.manual_clipping_service.add_event(session, queued_run, "cancelled", "Queued run cancelled")
+                session.commit()
+                await update.message.reply_text(f"Cancelled queued Run Log {queued_run.id}.")
+                return True
+        await update.message.reply_text("No active or queued run to cancel.")
+        return False
 
     async def handle_auth(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):

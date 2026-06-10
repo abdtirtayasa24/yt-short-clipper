@@ -194,7 +194,14 @@ class ManualClippingService:
 
     def process_selected_run(self, session: Session, settings: Settings, run_id: int) -> list[str]:
         run = session.get(RunLog, run_id)
-        if run is None or run.status != "selection_ready":
+        if run is None:
+            return []
+        if run.cancellation_requested:
+            run.status = "cancelled"
+            self.add_event(session, run, "cancelled", "Run cancelled before clipping started")
+            session.commit()
+            return []
+        if run.status != "selection_ready":
             return []
         if not self.clipping_queue.start(run_id):
             run.status = "queued"
@@ -209,6 +216,11 @@ class ManualClippingService:
             run.status = "processing"
             self.add_event(session, run, "processing", "Processing selected highlights")
             for candidate in selected_candidates:
+                if run.cancellation_requested:
+                    run.status = "cancelled"
+                    self.add_event(session, run, "cancelled", "Run cancelled before next clipping step")
+                    session.commit()
+                    return []
                 output_path = self.clip_processor.process_highlight(
                     run.source_url,
                     candidate,
@@ -284,6 +296,16 @@ class ManualClippingService:
             session.add(attempt)
         session.commit()
         return summaries
+
+    def request_cancellation(self, session: Session, run_id: int) -> bool:
+        run = session.get(RunLog, run_id)
+        if run is None:
+            return False
+        run.cancellation_requested = True
+        run.status = "cancellation_requested"
+        self.add_event(session, run, "cancellation_requested", "Cancellation requested by Authorized Operator")
+        session.commit()
+        return True
 
     def cancel_run(self, session: Session, run_id: int) -> bool:
         run = session.get(RunLog, run_id)

@@ -78,6 +78,69 @@ def test_fastapi_lifespan_starts_and_stops_telegram_bot(tmp_path):
     assert telegram_bot.stopped is True
 
 
+def test_status_shows_operational_state_and_source_queue_summary(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        service = ManualClippingService(settings, FakeHighlightFinder())
+        service.clipping_queue.active_run_id = 42
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            from bot_app.source_queue import add_source_videos
+
+            add_source_videos(session, ["https://youtu.be/pending"])
+            session.add(RunLog(source_url="https://youtu.be/recent", status="queued"))
+            session.commit()
+
+        status_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_status(status_update, None) is True
+        reply = status_update.message.replies[0]
+        assert "active run: 42" in reply
+        assert "queued runs: 1" in reply
+        assert "recent runs:" in reply
+        assert "Source Video Queue: pending=1" in reply
+
+    asyncio.run(run_test())
+
+
+def test_cancel_requests_active_run_cancellation_and_worker_stops_before_next_clip(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        processor = FakeClipProcessor(settings.clip_archive_dir)
+        service = ManualClippingService(
+            settings,
+            FakeHighlightFinder(),
+            clip_processor=processor,
+            metadata_generator=FakeMetadataGenerator(),
+        )
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            run = service.start_run(session, "https://youtu.be/manual")
+            service.select_candidates(session, run.id, [1, 2])
+            service.clipping_queue.active_run_id = run.id
+
+        cancel_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_cancel(cancel_update, FakeContext()) is True
+        assert "Cancellation requested for Run Log 1" in cancel_update.message.replies[0]
+
+        service.clipping_queue.active_run_id = None
+        with session_factory() as session:
+            links = service.process_selected_run(session, settings, 1)
+            run = session.get(RunLog, 1)
+            assert links == []
+            assert run.status == "cancelled"
+            assert run.cancellation_requested is True
+            assert processor.calls == []
+            assert session.scalars(select(RunEvent).where(RunEvent.event_type == "cancelled")).all()
+
+    asyncio.run(run_test())
+
+
 def test_authorized_operator_commands_work_and_unknown_chats_are_rejected(tmp_path):
     async def run_test():
         settings = make_settings(tmp_path)
