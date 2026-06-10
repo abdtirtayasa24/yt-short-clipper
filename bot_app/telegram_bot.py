@@ -49,6 +49,7 @@ class AuthorizedOperatorTelegramBot:
         self.application.add_handler(CommandHandler("schedule", self.handle_schedule))
         self.application.add_handler(CommandHandler("auth", self.handle_auth))
         self.application.add_handler(CommandHandler("cancel", self.handle_cancel))
+        self.application.add_handler(CallbackQueryHandler(self.handle_menu_callback, pattern=r"^menu:"))
         self.application.add_handler(CallbackQueryHandler(self.handle_clip_callback, pattern=r"^clip:"))
         self.application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, self.handle_video_upload))
         await self.application.initialize()
@@ -82,18 +83,73 @@ class AuthorizedOperatorTelegramBot:
             return False
         await update.message.reply_text(
             "Bot Control Mode is ready. Use /help to see available commands.",
+            reply_markup=self._home_menu_markup(),
         )
         return True
 
     async def handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
             return False
-        await update.message.reply_text("Available commands: /start, /help, /status, /defaults, /sources, /clip, /schedule, /auth")
+        await update.message.reply_text(
+            "Available commands: /start, /help, /status, /defaults, /sources, /clip, /schedule, /auth",
+            reply_markup=self._home_menu_markup(),
+        )
         return True
+
+    def _home_menu_markup(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("New Clip", callback_data="menu:new_clip")],
+                [InlineKeyboardButton("Source Queue", callback_data="menu:sources")],
+                [InlineKeyboardButton("Schedule", callback_data="menu:schedule")],
+                [InlineKeyboardButton("Workflow Defaults", callback_data="menu:defaults")],
+                [InlineKeyboardButton("Status", callback_data="menu:status")],
+                [InlineKeyboardButton("Auth", callback_data="menu:auth")],
+            ]
+        )
+
+    async def handle_menu_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        query = getattr(update, "callback_query", None)
+        if query is None:
+            return False
+        if await self._reject_unknown_chat(update):
+            await query.answer("Unauthorized chat.")
+            return False
+        action = str(getattr(query, "data", "")).split(":", 1)[-1]
+        await query.answer()
+        if action == "new_clip":
+            await query.edit_message_text(
+                "Send /clip <youtube_url_or_direct_video_url>, or upload a video file to start Manual Clipping.",
+                reply_markup=self._home_menu_markup(),
+            )
+            return True
+        if action == "sources":
+            await query.edit_message_text(self._format_source_videos(), reply_markup=self._home_menu_markup())
+            return True
+        if action == "schedule":
+            with self.session_factory() as session:
+                text = self._format_schedules(session)
+            await query.edit_message_text(text, reply_markup=self._home_menu_markup())
+            return True
+        if action == "defaults":
+            await query.edit_message_text(self._format_workflow_defaults(), reply_markup=self._home_menu_markup())
+            return True
+        if action == "status":
+            await query.edit_message_text(self._status_text(), reply_markup=self._home_menu_markup())
+            return True
+        if action == "auth":
+            await query.edit_message_text(self._auth_text(), reply_markup=self._home_menu_markup())
+            return True
+        await query.edit_message_text("Unknown menu action.", reply_markup=self._home_menu_markup())
+        return False
 
     async def handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
             return False
+        await update.message.reply_text(self._status_text())
+        return True
+
+    def _status_text(self) -> str:
         with self.session_factory() as session:
             active_run = self.manual_clipping_service.clipping_queue.active_run_id
             queued_runs = session.scalar(select(func.count()).select_from(RunLog).where(RunLog.status == "queued"))
@@ -106,14 +162,13 @@ class AuthorizedOperatorTelegramBot:
             }
         source_summary = ", ".join(f"{status}={count}" for status, count in sorted(source_counts.items())) or "none"
         recent_summary = ", ".join(f"#{run.id} {run.status}" for run in recent_runs) or "none"
-        await update.message.reply_text(
+        return (
             "Bot Control Mode status: ok\n"
             f"active run: {active_run or 'none'}\n"
             f"queued runs: {queued_runs}\n"
             f"recent runs: {recent_summary}\n"
             f"Source Video Queue: {source_summary}"
         )
-        return True
 
     async def handle_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
@@ -136,15 +191,18 @@ class AuthorizedOperatorTelegramBot:
     async def handle_auth(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
             return False
+        await update.message.reply_text(self._auth_text())
+        return True
+
+    def _auth_text(self) -> str:
         youtube_status = "preauthorized" if self.settings.youtube_credentials_path.exists() else "missing"
         tiktok_status = "preauthorized" if self.settings.tiktok_session_path.exists() else "missing"
-        await update.message.reply_text(
+        return (
             "Preauthorization Setup status for VPS deployment:\n"
             f"YouTube: {youtube_status} ({self.settings.youtube_credentials_path})\n"
             f"TikTok: {tiktok_status} ({self.settings.tiktok_session_path})\n"
             "Run one-time local setup to create these files before enabling scheduled Publishing."
         )
-        return True
 
     async def handle_schedule(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):

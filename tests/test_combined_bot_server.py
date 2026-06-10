@@ -147,7 +147,7 @@ def test_telegram_bot_start_polls_for_updates_and_stop_shuts_down(monkeypatch, t
         await bot.start()
 
         assert bot.started is True
-        assert len(fake_application.handlers) == 11
+        assert len(fake_application.handlers) == 12
         assert fake_application.calls == [
             ("initialize", {}),
             ("start_polling", {"drop_pending_updates": True}),
@@ -238,6 +238,51 @@ def test_cancel_requests_active_run_cancellation_and_worker_stops_before_next_cl
             assert run.cancellation_requested is True
             assert processor.calls == []
             assert session.scalars(select(RunEvent).where(RunEvent.event_type == "cancelled")).all()
+
+    asyncio.run(run_test())
+
+
+def test_start_and_help_show_inline_home_menu(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        bot = AuthorizedOperatorTelegramBot(settings)
+
+        start_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        help_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_start(start_update, None) is True
+        assert await bot.handle_help(help_update, None) is True
+
+        start_markup = start_update.message.reply_markups[0]
+        help_markup = help_update.message.reply_markups[0]
+        start_buttons = [button.text for row in start_markup.inline_keyboard for button in row]
+        assert start_buttons == ["New Clip", "Source Queue", "Schedule", "Workflow Defaults", "Status", "Auth"]
+        assert help_markup is not None
+        assert "/status" in help_update.message.replies[0]
+
+    asyncio.run(run_test())
+
+
+def test_home_menu_callbacks_route_to_status_auth_and_prompts(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        bot = AuthorizedOperatorTelegramBot(settings)
+
+        status_query = FakeCallbackQuery("menu:status")
+        assert await bot.handle_menu_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=status_query), FakeContext()) is True
+        assert "status: ok" in status_query.edits[0]
+
+        auth_query = FakeCallbackQuery("menu:auth")
+        assert await bot.handle_menu_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=auth_query), FakeContext()) is True
+        assert "Preauthorization Setup" in auth_query.edits[0]
+
+        clip_query = FakeCallbackQuery("menu:new_clip")
+        assert await bot.handle_menu_callback(FakeUpdate(settings.telegram_authorized_chat_id, callback_query=clip_query), FakeContext()) is True
+        assert "/clip" in clip_query.edits[0]
+
+        unauthorized = FakeCallbackQuery("menu:status")
+        assert await bot.handle_menu_callback(FakeUpdate(999, callback_query=unauthorized), FakeContext()) is False
+        assert unauthorized.answers == ["Unauthorized chat."]
 
     asyncio.run(run_test())
 
