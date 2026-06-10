@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from bot_app.ai_providers import GeminiTextProvider, OpenRouterAudioAdapter
 from bot_app.clip_archive import cleanup_expired_clips, create_clip_record
-from bot_app.manual_clipping import HighlightDraft, ManualClippingService, PublishingMetadata
+from bot_app.manual_clipping import GeminiHighlightFinder, HighlightDraft, ManualClippingService, PublishingMetadata
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
 from bot_app.models import ClipRecord, HighlightCandidate, PublishAttempt, RunEvent, RunLog, WorkflowDefaults
@@ -242,6 +242,11 @@ def test_authorized_operator_commands_work_and_unknown_chats_are_rejected(tmp_pa
     asyncio.run(run_test())
 
 
+class FailingHighlightFinder:
+    def find_highlights(self, youtube_url, count):
+        raise ValueError("Gemini did not return valid highlight JSON")
+
+
 class FakeHighlightFinder:
     def __init__(self):
         self.calls = []
@@ -259,6 +264,60 @@ class FakeHighlightFinder:
             )
             for _ in range(count)
         ]
+
+
+def test_gemini_highlight_finder_accepts_fenced_json_response():
+    class FakeProvider:
+        def generate_text(self, prompt):
+            return """```json
+[
+  {
+    "title": "Great moment",
+    "start_time": "00:00:01,000",
+    "end_time": "00:01:01,000",
+    "virality_score": 9,
+    "hook_text": "Watch this",
+    "description": "A strong highlight"
+  }
+]
+```"""
+
+    finder = GeminiHighlightFinder.__new__(GeminiHighlightFinder)
+    finder.provider = FakeProvider()
+
+    highlights = finder.find_highlights("https://youtu.be/manual", 1)
+
+    assert highlights == [
+        HighlightDraft(
+            title="Great moment",
+            start_time="00:00:01,000",
+            end_time="00:01:01,000",
+            virality_score=9,
+            hook_text="Watch this",
+            description="A strong highlight",
+        )
+    ]
+
+
+def test_clip_start_failure_replies_and_records_failed_run(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        service = ManualClippingService(settings, FailingHighlightFinder())
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(update, FakeContext(["https://youtu.be/manual"])) is False
+        assert "Manual Clipping failed" in update.message.replies[0]
+        assert "Gemini did not return valid highlight JSON" in update.message.replies[0]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            run = session.scalars(select(RunLog)).one()
+            assert run.status == "failed"
+            assert "Gemini did not return valid highlight JSON" in run.error_message
+
+    asyncio.run(run_test())
 
 
 def test_authorized_operator_can_start_select_and_cancel_manual_clipping(tmp_path):

@@ -50,6 +50,34 @@ class MetadataGenerator(Protocol):
         ...
 
 
+def _parse_gemini_json(raw_response: str, expected_root: str):
+    text = (raw_response or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    if expected_root == "array":
+        start = text.find("[")
+        end = text.rfind("]")
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start : end + 1]
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Gemini did not return valid JSON. This usually means the model returned prose, "
+            "an empty response, or content that was not grounded in a transcript."
+        ) from exc
+
+
 class GeminiMetadataGenerator:
     def __init__(self, settings: Settings):
         self.provider = GeminiTextProvider(settings)
@@ -64,7 +92,7 @@ class GeminiMetadataGenerator:
             "Generate shared publishing metadata as JSON with title, description, and hashtags "
             f"for this clip from {source_url}: {candidate.title}. {candidate.description}"
         )
-        data = json.loads(self.provider.generate_text(prompt, model=model))
+        data = _parse_gemini_json(self.provider.generate_text(prompt, model=model), "object")
         return PublishingMetadata(
             title=data["title"],
             description=data["description"],
@@ -121,7 +149,7 @@ class GeminiHighlightFinder:
             "Return JSON array with title, start_time, end_time, virality_score, hook_text, description."
         )
         raw_response = self.provider.generate_text(prompt)
-        data = json.loads(raw_response)
+        data = _parse_gemini_json(raw_response, "array")
         return [HighlightDraft(**item) for item in data[:count]]
 
 

@@ -230,20 +230,28 @@ class AuthorizedOperatorTelegramBot:
 
         if args[0] == "process" and len(args) == 2 and args[1].isdigit():
             run_id = int(args[1])
-            with self.session_factory() as session:
-                links = self.manual_clipping_service.process_selected_run(session, self.settings, run_id)
-            if links:
-                await update.message.reply_text("Public Clip Links:\n" + "\n".join(links))
-                return True
-            await update.message.reply_text("Run is queued or cannot be processed yet.")
-            return False
+            try:
+                with self.session_factory() as session:
+                    links = self.manual_clipping_service.process_selected_run(session, self.settings, run_id)
+                if links:
+                    await update.message.reply_text("Public Clip Links:\n" + "\n".join(links))
+                    return True
+                await update.message.reply_text("Run is queued or cannot be processed yet.")
+                return False
+            except Exception as exc:
+                await update.message.reply_text(f"Manual Clipping processing failed: {exc}")
+                return False
 
         if len(args) == 1:
-            with self.session_factory() as session:
-                run = self.manual_clipping_service.start_run(session, args[0])
-                response = self._format_highlight_review(run)
-            await update.message.reply_text(response)
-            return True
+            try:
+                with self.session_factory() as session:
+                    run = self.manual_clipping_service.start_run(session, args[0])
+                    response = self._format_highlight_review(run)
+                await update.message.reply_text(response)
+                return True
+            except Exception as exc:
+                await update.message.reply_text(f"Manual Clipping failed: {exc}")
+                return False
 
         await update.message.reply_text(self._clip_usage())
         return False
