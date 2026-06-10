@@ -1,11 +1,13 @@
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Protocol
 
 from sqlalchemy.orm import Session
 
 from bot_app.ai_providers import GeminiTextProvider
+from bot_app.clip_archive import create_clip_record
 from bot_app.database import ensure_workflow_defaults
 from bot_app.models import HighlightCandidate, RunEvent, RunLog
 from bot_app.settings import Settings
@@ -26,6 +28,45 @@ class HighlightFinder(Protocol):
         ...
 
 
+class ClipProcessor(Protocol):
+    def process_highlight(
+        self,
+        source_url: str,
+        candidate: HighlightCandidate,
+        *,
+        captions_enabled: bool,
+        hooks_enabled: bool,
+    ) -> Path:
+        ...
+
+
+class ExistingClipProcessor:
+    def process_highlight(
+        self,
+        source_url: str,
+        candidate: HighlightCandidate,
+        *,
+        captions_enabled: bool,
+        hooks_enabled: bool,
+    ) -> Path:
+        raise NotImplementedError("Existing clipping behavior is not wired for Bot Control Mode yet")
+
+
+class ClippingQueue:
+    def __init__(self):
+        self.active_run_id: int | None = None
+
+    def start(self, run_id: int) -> bool:
+        if self.active_run_id is not None:
+            return False
+        self.active_run_id = run_id
+        return True
+
+    def finish(self, run_id: int) -> None:
+        if self.active_run_id == run_id:
+            self.active_run_id = None
+
+
 class GeminiHighlightFinder:
     def __init__(self, settings: Settings):
         self.provider = GeminiTextProvider(settings)
@@ -41,9 +82,17 @@ class GeminiHighlightFinder:
 
 
 class ManualClippingService:
-    def __init__(self, settings: Settings, highlight_finder: HighlightFinder | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        highlight_finder: HighlightFinder | None = None,
+        clip_processor: ClipProcessor | None = None,
+        clipping_queue: ClippingQueue | None = None,
+    ):
         self.settings = settings
         self.highlight_finder = highlight_finder or GeminiHighlightFinder(settings)
+        self.clip_processor = clip_processor or ExistingClipProcessor()
+        self.clipping_queue = clipping_queue or ClippingQueue()
 
     def start_run(self, session: Session, youtube_url: str) -> RunLog:
         defaults = ensure_workflow_defaults(session)
@@ -92,6 +141,45 @@ class ManualClippingService:
         self.add_event(session, run, "selected", f"Selected highlights: {run.selected_highlights}")
         session.commit()
         return True
+
+    def process_selected_run(self, session: Session, settings: Settings, run_id: int) -> list[str]:
+        run = session.get(RunLog, run_id)
+        if run is None or run.status != "selection_ready":
+            return []
+        if not self.clipping_queue.start(run_id):
+            run.status = "queued"
+            self.add_event(session, run, "queued", "Clipping Queue already has an active run")
+            session.commit()
+            return []
+
+        defaults = ensure_workflow_defaults(session)
+        selected_candidates = [candidate for candidate in run.highlight_candidates if candidate.selected]
+        links = []
+        try:
+            run.status = "processing"
+            self.add_event(session, run, "processing", "Processing selected highlights")
+            for candidate in selected_candidates:
+                output_path = self.clip_processor.process_highlight(
+                    run.source_url,
+                    candidate,
+                    captions_enabled=defaults.captions_enabled,
+                    hooks_enabled=defaults.hooks_enabled,
+                )
+                clip = create_clip_record(session, settings, output_path)
+                links.append(clip.public_clip_link)
+                self.add_event(session, run, "clip_archived", clip.public_clip_link)
+            run.status = "processed"
+            self.add_event(session, run, "processed", f"Generated {len(links)} Public Clip Links")
+            session.commit()
+            return links
+        except Exception as exc:
+            run.status = "failed"
+            run.error_message = str(exc)
+            self.add_event(session, run, "error", str(exc))
+            session.commit()
+            raise
+        finally:
+            self.clipping_queue.finish(run_id)
 
     def cancel_run(self, session: Session, run_id: int) -> bool:
         run = session.get(RunLog, run_id)

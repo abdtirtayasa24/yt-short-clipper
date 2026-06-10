@@ -10,7 +10,7 @@ from bot_app.clip_archive import create_clip_record
 from bot_app.manual_clipping import HighlightDraft, ManualClippingService
 from bot_app.database import create_session_factory, initialize_database
 from bot_app.main import create_app
-from bot_app.models import HighlightCandidate, RunEvent, RunLog, WorkflowDefaults
+from bot_app.models import ClipRecord, HighlightCandidate, RunEvent, RunLog, WorkflowDefaults
 from bot_app.source_queue import consume_source_video, get_pending_source_videos
 from bot_app.settings import Settings
 from bot_app.telegram_bot import AuthorizedOperatorTelegramBot
@@ -159,6 +159,76 @@ def test_authorized_operator_can_start_select_and_cancel_manual_clipping(tmp_pat
             assert len(session.scalars(select(RunEvent)).all()) >= 5
 
     asyncio.run(run_test())
+
+
+class FakeClipProcessor:
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+        self.calls = []
+
+    def process_highlight(self, source_url, candidate, *, captions_enabled, hooks_enabled):
+        self.calls.append((source_url, candidate.candidate_number, captions_enabled, hooks_enabled))
+        output_path = self.output_dir / f"clip-{candidate.candidate_number}.mp4"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(f"clip-{candidate.candidate_number}".encode())
+        return output_path
+
+
+def test_authorized_operator_processes_selected_highlights_into_public_clip_links(tmp_path):
+    async def run_test():
+        settings = make_settings(tmp_path)
+        initialize_database(settings.database_url)
+        finder = FakeHighlightFinder()
+        processor = FakeClipProcessor(settings.clip_archive_dir)
+        service = ManualClippingService(settings, finder, clip_processor=processor)
+        bot = AuthorizedOperatorTelegramBot(settings, manual_clipping_service=service)
+
+        assert await bot.handle_clip(
+            FakeUpdate(settings.telegram_authorized_chat_id),
+            FakeContext(["https://youtu.be/manual"]),
+        ) is True
+        assert await bot.handle_clip(
+            FakeUpdate(settings.telegram_authorized_chat_id),
+            FakeContext(["select", "1", "1", "3"]),
+        ) is True
+
+        process_update = FakeUpdate(settings.telegram_authorized_chat_id)
+        assert await bot.handle_clip(process_update, FakeContext(["process", "1"])) is True
+        reply = process_update.message.replies[0]
+        assert "https://clips.example.com/clips/" in reply
+        assert "download" in reply
+        assert processor.calls == [
+            ("https://youtu.be/manual", 1, True, True),
+            ("https://youtu.be/manual", 3, True, True),
+        ]
+
+        session_factory = create_session_factory(settings.database_url)
+        with session_factory() as session:
+            run = session.get(RunLog, 1)
+            assert run.status == "processed"
+            clips = session.scalars(select(ClipRecord).order_by(ClipRecord.id)).all()
+            assert len(clips) == 2
+            assert all(clip.public_clip_link in reply for clip in clips)
+
+    asyncio.run(run_test())
+
+
+def test_clipping_queue_allows_only_one_active_run(tmp_path):
+    settings = make_settings(tmp_path)
+    initialize_database(settings.database_url)
+    processor = FakeClipProcessor(settings.clip_archive_dir)
+    service = ManualClippingService(settings, FakeHighlightFinder(), clip_processor=processor)
+    service.clipping_queue.active_run_id = 99
+
+    session_factory = create_session_factory(settings.database_url)
+    with session_factory() as session:
+        run = service.start_run(session, "https://youtu.be/manual")
+        service.select_candidates(session, run.id, [1])
+        links = service.process_selected_run(session, settings, run.id)
+
+        assert links == []
+        assert session.get(RunLog, run.id).status == "queued"
+        assert processor.calls == []
 
 
 def test_clip_rejects_unknown_chats_without_creating_run_logs(tmp_path):

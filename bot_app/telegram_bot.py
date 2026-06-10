@@ -114,6 +114,16 @@ class AuthorizedOperatorTelegramBot:
             await update.message.reply_text(self._clip_usage())
             return False
 
+        if args[0] == "process" and len(args) == 2 and args[1].isdigit():
+            run_id = int(args[1])
+            with self.session_factory() as session:
+                links = self.manual_clipping_service.process_selected_run(session, self.settings, run_id)
+            if links:
+                await update.message.reply_text("Public Clip Links:\n" + "\n".join(links))
+                return True
+            await update.message.reply_text("Run is queued or cannot be processed yet.")
+            return False
+
         if len(args) == 1:
             with self.session_factory() as session:
                 run = self.manual_clipping_service.start_run(session, args[0])
@@ -140,7 +150,10 @@ class AuthorizedOperatorTelegramBot:
         return "\n".join(lines)
 
     def _clip_usage(self) -> str:
-        return "Usage: /clip <youtube_url>, /clip select <run_id> <numbers...>, or /clip cancel <run_id>"
+        return (
+            "Usage: /clip <youtube_url>, /clip select <run_id> <numbers...>, "
+            "/clip process <run_id>, or /clip cancel <run_id>"
+        )
 
     async def handle_sources(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if await self._reject_unknown_chat(update):
