@@ -15,6 +15,7 @@ from bot_app.scheduler import add_daily_schedule, fire_schedule
 from bot_app.source_queue import add_source_videos, consume_source_video, get_pending_source_videos
 from bot_app.settings import Settings
 from bot_app.telegram_bot import AuthorizedOperatorTelegramBot
+from clipper_core import AutoClipperCore
 
 
 def make_settings(tmp_path: Path) -> Settings:
@@ -1477,6 +1478,47 @@ def test_openrouter_audio_adapter_points_openai_sdk_at_openrouter(monkeypatch, t
             "input": "listen now",
         }
     ]
+
+
+def test_core_transcription_uses_openrouter_json_audio_payload(monkeypatch, tmp_path):
+    audio_file = tmp_path / "audio.mp3"
+    audio_file.write_bytes(b"mp3-bytes")
+    posts = []
+
+    class FakeResponse:
+        text = '{"text":"hello world"}'
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"text": "hello world"}
+
+    def fake_post(url, headers=None, json=None, data=None, files=None, timeout=None):
+        posts.append({"url": url, "headers": headers, "json": json, "data": data, "files": files, "timeout": timeout})
+        return FakeResponse()
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    core = AutoClipperCore.__new__(AutoClipperCore)
+    core.caption_client = type("CaptionClient", (), {"base_url": "https://openrouter.ai/api/v1", "api_key": "test-key"})()
+    core.whisper_model = "openai/whisper-1"
+    core.subtitle_language = "en"
+    core.ffmpeg_path = "/no/ffmpeg"
+    core.log = lambda *_args, **_kwargs: None
+    core.set_progress = lambda *_args, **_kwargs: None
+    core.is_cancelled = lambda: False
+
+    segments = core._whisper_transcribe_file(str(audio_file), 5)
+
+    assert segments == [{"start": 5, "end": 35, "text": "hello world"}]
+    assert posts[0]["url"] == "https://openrouter.ai/api/v1/audio/transcriptions"
+    assert posts[0]["headers"]["Content-Type"] == "application/json"
+    assert posts[0]["json"]["model"] == "openai/whisper-1"
+    assert posts[0]["json"]["input_audio"]["format"] == "mp3"
+    assert posts[0]["json"]["input_audio"]["data"]
+    assert posts[0]["data"] is None
+    assert posts[0]["files"] is None
 
 
 def test_environment_configuration_does_not_require_openai_provider_settings(tmp_path):

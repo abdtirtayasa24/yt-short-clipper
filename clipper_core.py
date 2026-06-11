@@ -3,6 +3,7 @@ Auto Clipper Core - Processing logic
 Refactored to use OpenAI Whisper API instead of local model
 """
 
+import base64
 import subprocess
 import os
 import re
@@ -1992,6 +1993,18 @@ Transcript:
         
         return transcript
     
+    def _probe_audio_duration(self, audio_path: str) -> float | None:
+        try:
+            probe_cmd = [self.ffmpeg_path, "-i", audio_path, "-f", "null", "-"]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
+            duration_match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", probe_result.stderr)
+            if not duration_match:
+                return None
+            h, m, s = duration_match.groups()
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        except Exception:
+            return None
+
     def _whisper_transcribe_file(self, audio_path: str, time_offset: float = 0) -> list:
         """Transcribe a single audio file with Whisper API.
         
@@ -2014,16 +2027,24 @@ Transcript:
         self.log(f"    Uploading {file_size_mb:.1f}MB to Whisper API ({self.whisper_model})...")
         self.log(f"    Base URL: {base_url}")
         
-        # Build multipart form data
+        # OpenRouter's transcription endpoint expects JSON with base64 audio.
         url = f"{base_url}/audio/transcriptions"
-        headers = {"Authorization": f"Bearer {api_key}"}
-        
-        form_data = {
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        audio_format = Path(audio_path).suffix.lower().lstrip(".") or "mp3"
+        with open(audio_path, "rb") as audio_input:
+            encoded_audio = base64.b64encode(audio_input.read()).decode("ascii")
+        payload = {
             "model": self.whisper_model,
-            "response_format": "verbose_json",
+            "input_audio": {
+                "data": encoded_audio,
+                "format": audio_format,
+            },
         }
         if self.subtitle_language and self.subtitle_language != "none":
-            form_data["language"] = self.subtitle_language
+            payload["language"] = self.subtitle_language
         
         # Run API call in a thread so we can log heartbeat while waiting
         response_data = None
@@ -2032,11 +2053,12 @@ Transcript:
         def _call_api():
             nonlocal response_data, api_error
             try:
-                with open(audio_path, "rb") as f:
-                    files = {"file": (os.path.basename(audio_path), f, "audio/mpeg")}
-                    resp = _requests.post(url, headers=headers, data=form_data, files=files, timeout=600)
-                    resp.raise_for_status()
-                    response_data = resp.json()
+                resp = _requests.post(url, headers=headers, json=payload, timeout=600)
+                status_code = getattr(resp, "status_code", 200)
+                if status_code >= 400:
+                    raise Exception(f"{status_code} Client Error: {resp.text[:500]}")
+                resp.raise_for_status()
+                response_data = resp.json()
             except Exception as e:
                 api_error = e
         
@@ -2092,6 +2114,13 @@ Transcript:
                     "end": seg.get("end", 0) + time_offset,
                     "text": seg.get("text", "")
                 })
+        elif response_data.get("text"):
+            duration = self._probe_audio_duration(audio_path) or 30.0
+            segments.append({
+                "start": time_offset,
+                "end": time_offset + duration,
+                "text": response_data.get("text", ""),
+            })
         
         return segments
     
